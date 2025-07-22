@@ -16,43 +16,92 @@ from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer # T
 from sklearn.naive_bayes import MultinomialNB # Standard multinomial naive Bayes described in the chapter - uses word counts/frequencies as features
 from sklearn.naive_bayes import BernoulliNB #  "Multivariate Bernoulli naive Bayes" (different from binary multinomial NB) - estimates P(w|c) as the fraction of documents containing a term and includes probability for term absence
 from sklearn.model_selection import train_test_split, cross_val_score # Data splitting and validation
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, classification_report
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+
+
 
 import nltk # nat lang tool kit
 from nltk.corpus import stopwords
 
 import re
 
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+import random
+from scipy import stats
+
 # Download required NLTK data (one-time setup)
 nltk.download('stopwords')
 
 """## Text sample with ground truth/gold labels"""
 
-# Each text represents a document to classify
+# Each text represents a document to classify - EXPANDED DATASET
 texts = [
-    "I love this movie!.... It's sweet, but with satirical humor.",  # Positive sentiment
+    "I love this movie! It's sweet, but with satirical humor.",  # Positive sentiment
     "The dialogue is great and the adventure scenes are fun.",   # Positive sentiment
     "It was pathetic. The worst part about it was the boxing scenes.",  # Negative sentiment
     "No plot twists or great scenes. Entirely predictable.",     # Negative sentiment
     "Awesome caramel sauce and sweet toasty almonds. I love this place!",  # Positive sentiment
     "Awful pizza and ridiculously overpriced food.",            # Negative sentiment
     "Very powerful and the most fun film of the summer.",       # Positive sentiment
-    "Just plain boring and lacks energy. No surprises."         # Negative sentiment
+    "Just plain boring and lacks energy. No surprises.",        # Negative sentiment
+
+    # Additional positive examples
+    "Absolutely fantastic! Best movie I've seen this year.",     # Positive sentiment
+    "Brilliant acting and wonderful cinematography throughout.",  # Positive sentiment
+    "Perfect blend of comedy and drama. Highly recommend!",      # Positive sentiment
+    "Outstanding performance by the lead actor. Amazing!",      # Positive sentiment
+    "Incredible storyline that kept me engaged until the end.",  # Positive sentiment
+    "Beautiful soundtrack and excellent direction. Loved it!",   # Positive sentiment
+
+    # Additional negative examples
+    "Terrible acting and a completely boring plot.",            # Negative sentiment
+    "Worst restaurant experience ever. Food was disgusting.",   # Negative sentiment
+    "Completely disappointing. Waste of time and money.",       # Negative sentiment
+    "Poor service and the quality was absolutely horrible.",    # Negative sentiment
+    "Annoying characters and a ridiculous storyline.",         # Negative sentiment
+    "Frustrating experience. Nothing worked as expected.",      # Negative sentiment
+
+    # Examples with negation for testing negation handling
+    "Not bad, but could definitely be much better.",            # Mixed/Negative sentiment
+    "I don't hate it, but it's not great either.",            # Mixed/Negative sentiment
+    "Can't say I didn't enjoy parts of it.",                   # Mixed/Positive sentiment
+    "It's not terrible, actually quite entertaining.",          # Positive sentiment
 ]
 
-# Corresponding labels for each text (ground truth)
+# Corresponding labels for each text (ground truth) - EXPANDED LABELS
 labels = ['positive', 'positive', 'negative', 'negative',
-          'positive', 'negative', 'positive', 'negative']
+          'positive', 'negative', 'positive', 'negative',
+          # Additional labels
+          'positive', 'positive', 'positive', 'positive',
+          'positive', 'positive', 'negative', 'negative',
+          'negative', 'negative', 'negative', 'negative',
+          # Negation examples - these are subjective, adjust as needed
+          'negative', 'negative', 'positive', 'positive']
+
+print(f"Total documents: {len(texts)}")
+print(f"Total labels: {len(labels)}")
+print(f"Positive examples: {labels.count('positive')}")
+print(f"Negative examples: {labels.count('negative')}")
 
 """## Basic preprocessing"""
 
 # Basic preprocessing like the one from the book
-def preprocess_text(text):
+def preprocess_text(text, remove_stopwords=False):
   """Clean and normalize text for processing"""
 
   text = text.lower()
   # Removing punctuation but keeping spaces and letters/numbers
   text = re.sub(r'[^\w\s]','',text) ## caret = the opposite(in this case: non words, non spaces); \w = words ; \s = whitespaces
+
+  if remove_stopwords:
+    stop_words = set(stopwords.words('english'))
+    words = text.split()
+    text = ' '.join([word for word in words if word not in stop_words])
+
+
   return text
 
 processed_texts = [preprocess_text(text) for text in texts]
@@ -271,7 +320,7 @@ for i, class_name in enumerate(binary_nb.classes_):
 
 
 
-"""### Compare predictions from both approaches
+"""### Compare the predictions from both approaches
 
 """
 
@@ -279,4 +328,289 @@ y_test
 
 print("Multinomial NB predictions:", multinomial_nb.predict(X_test_counts))
 print("Binary NB predictions:", binary_nb.predict(X_test_binary))
+
+"""##Evaluation Metrics"""
+
+def evaluate_classifier(classifier, X_test, y_test, class_names):
+  """Comprehensive evaluation as described in the book"""
+
+  y_pred = classifier.predict(X_test)
+
+  print("\nclassification_report:")
+  print(classification_report(y_test, y_pred, target_names=class_names))
+  print("\n\n")
+
+  # Precision, Recall and F1-score, support (Number of observations, helps seeing imbalance)
+  precision, recall, f1, support = precision_recall_fscore_support(
+    y_test, y_pred, average = None, labels = class_names)
+
+  # Macro and Micro Averages
+  macro_f1 = precision_recall_fscore_support(y_test, y_pred, average='macro')[2]
+  micro_f1 = precision_recall_fscore_support(y_test, y_pred, average='micro')[2]
+
+
+  print("\nEvaluation Rsults:\n")
+  print("-"*50)
+  for i, class_name in enumerate(class_names):
+    print(f"{class_name:>10}: Precision={precision[i]:.3f}, "
+          f"Recall={recall[i]:.3f}, F1-Score={f1[i]:.3f}")
+
+  print(f"\nMacro-Averaged F1: {macro_f1:.3f}")  # Compute F1 for each class separately, then average. Better reflects performance on smaller classes.
+  print(f"\nMicro-Averaged F1: {micro_f1:.3f}")  # Pool all predictions into one confusion matrix, then compute F1. Dominated by larger classes.
+
+  # Confusion Matrix
+  cm = confusion_matrix(y_test, y_pred, labels=class_names)
+  plt.figure(figsize=(8, 6))
+  sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+              xticklabels=class_names, yticklabels=class_names)
+  plt.title('Confusion Matrix')
+  plt.ylabel('True Label')
+  plt.xlabel('Predicted Label')
+  plt.show()
+
+  return precision, recall, f1
+
+### Just 24 documents gives a poor result but it is the correct one
+
+if len(X_test) > 0:
+  class_names = ['negative', 'positive']
+  print("=== MULTINOMIAL NB ===")
+  evaluate_classifier(multinomial_nb, X_test_counts, y_test, class_names)
+
+  print("\n=== BINARY NB ===")
+  evaluate_classifier(binary_nb, X_test_binary, y_test, class_names)
+
+"""## Cross Validation"""
+
+def perform_cross_validation(texts, labels, k=5):
+  """K-fold cross validation as described in the book"""
+
+  vectorizer = CountVectorizer()           # Create vectorizer
+  X = vectorizer.fit_transform(texts)      # Convert texts to feature matrix
+  print("X: ",str( X[:10]))
+
+  y = np.array(labels)                     # Convert labels to numpy array
+  print("Y: ", str(y))
+
+  # Creating stratified k-fold cross-validator
+  cv = StratifiedKFold(n_splits = k,
+                       shuffle = True,    # Shuffle before sampling
+                       random_state = 42)
+
+  print("\n\n")
+  # Test different classifiers
+  classifiers = {
+      'Multinomial NB': MultinomialNB(alpha=1.0 ),
+      'Binary NB': BernoulliNB(alpha=1.0)
+  }
+
+  for name, classifier in classifiers.items():
+    scores = cross_val_score(classifier, X, y,
+                             cv = cv,
+                             scoring = 'f1_macro')
+
+    print(f"{name}: {scores.mean():.3f} (+/- {scores.std()*2:.3f})")  # Show mean and standard deviation (confidence interval)
+
+# Exaple
+perform_cross_validation(processed_texts, labels, k=3)  # Use k=3 for small dataset
+
+"""#####Multinomial NB slightly wins by 0.019 points
+#####Both perform similarly
+#####Difference is small and likely not statistically significant
+##### Adding more data is required
+
+##Statistical Significance Testing
+"""
+
+def bootstrap_test(scores_a, scores_b, n_bootstrap=1000):
+  """
+  Simplified bootstrap test for comparing two classifiers
+  Paired bootstrap based on the book
+  """
+
+  observed_diff = np.mean(scores_a) - np.mean(scores_b) # δ(x) The Effect Size
+
+  # Bootstrap resampling procedure
+  bootstrap_diffs = []
+  combined_scores = list(zip(scores_a, scores_b))
+
+  for _ in range(n_bootstrap):
+    # Resample with replacement
+    resampled = random.choices( combined_scores, k = len(combined_scores))
+    resampled_a, resampled_b = zip(*resampled)
+
+    diff = np.mean(resampled_a) - np.mean(resampled_b) ## Checking again the difference to verify if it is still the same δ(x)
+    bootstrap_diffs.append(diff)
+
+  # Counting how often bootstrap difference ≥ 2 * observed difference as appears in the book
+  extreme_count = sum(1 for diff in bootstrap_diffs if diff >= 2 * observed_diff)
+  print("extreme_count: ", str(extreme_count))
+
+  # Calculation of P-Value
+  p_value = extreme_count / n_bootstrap # proportion of extreme cases
+
+  return observed_diff, p_value
+
+# Example usage (would need actual score data from multiple test runs)
+scores_classifier_a = [0.85, 0.82, 0.88, 0.86, 0.84]  # Performance scores for classifier A
+scores_classifier_b = [0.2, 0.82, 0.7, 0.7, 0.34]  # Performance scores for classifier B
+diff, p_val = bootstrap_test(scores_classifier_a, scores_classifier_b)
+print(f"Observed difference: {diff:.3f}, p-value: {p_val:.3f}")
+if p_val <= 0.01: print("There is a statistically significant difference") ## Although some authors recommend even a lower threshold for NLP
+
+"""## Sentiment Lexicons"""
+
+positive_words = {
+    'great', 'awesome', 'fantastic', 'excellent', 'wonderful',
+    'amazing', 'brilliant', 'outstanding', 'perfect', 'love',
+    'beautiful', 'incredible', 'superb', 'marvelous', 'fabulous'
+}
+
+negative_words = {
+    'terrible', 'awful', 'horrible', 'bad', 'worst',
+    'pathetic', 'disgusting', 'hate', 'ridiculous', 'boring',
+    'stupid', 'useless', 'disappointing', 'annoying', 'frustrating'
+}
+
+def lexicon_features(text):
+  """Extract lexicon-based features from text"""
+
+  words = text.lower().split()
+
+  # Count of positive and negative words
+  pos_count = sum(1 for word in words if word in positive_words)
+  neg_count = sum(1 for word in words if word in negative_words)
+
+  # Retrieves feature dictionary
+  return{
+      'positive_word_count': pos_count,
+      'negative_word_count': neg_count,
+      'sentiment_score': pos_count - neg_count
+  }
+
+# Example usage
+text = "This movie is awesome but the ending was terrible"
+features = lexicon_features(text)
+print("Lexicon features:", features)  # Should show: positive=1, negative=1, score=0
+
+"""## Complete Pipeline Example"""
+
+class SentimentClassifier:
+  """Complete sentiment classification pipeline"""
+
+  def __init__(self, use_negation=True, use_binary=True, remove_stopwords=False):
+    self.use_negation = use_negation # Negation handling. Adding prefix NOT_
+    self.use_binary = use_binary # Binary NB
+    self.remove_stopwords = remove_stopwords
+
+    self.vectorizer = CountVectorizer(binary=use_binary) # Binary vectorizer
+
+    self.classifier = BernoulliNB() if use_binary else MultinomialNB()
+
+    if self.remove_stopwords:
+      self.stop_words = set(stopwords.words('english'))
+
+
+  def preprocess(self, texts):
+    """Applying preprocessing with negation handling included"""
+
+    processed = []
+
+    for text in texts:
+
+      if self.use_negation:
+        text = handle_negation(text) # Handle negation while punctuation is still present
+
+
+      text = re.sub('[^\w\s]', '', text.lower()) # Removes the complement of chars and spaces, and lowercases the rest
+
+
+      if self.remove_stopwords:
+        words = text.split()
+        text = ' '.join([word for word in words if word not in self.stop_words])
+
+      processed.append(text)
+
+    print("\nprocessed: ", str(processed),"\n\n")
+    return(processed)
+
+
+
+  def train(self, texts, labels):
+    """Train classifier on provided data"""
+
+    processed_texts = self.preprocess(texts)
+    X = self.vectorizer.fit_transform(processed_texts)
+    self.classifier.fit(X, labels)
+
+  def predict(self, texts):
+    """Make predictions on new data"""
+    processed_texts = self.preprocess(texts)
+    X = self.vectorizer.transform(processed_texts)
+    return self.classifier.predict(X)
+
+  def predict_probability(self, texts):
+    """Get the prediction probabilities per each class"""
+    processed_texts = self.preprocess(texts)
+    X = self.vectorizer.transform(processed_texts)
+    return self.classifier.predict_proba(X)
+
+"""## Example"""
+
+classifier = SentimentClassifier(use_negation=True, use_binary=True)  # Enable both optimizations
+classifier.train(texts, labels)
+
+## Generated complex examples
+new_texts = [
+    # === NEGATION EXAMPLES ===
+    "I don't like this movie",                          # Simple negation - negative
+    "This movie is not bad",                            # Negated negative word - positive
+    "I can't say I didn't enjoy it",                    # Double negation - positive
+    "It's not terrible, actually quite good",           # Negation + positive - positive
+    "Never seen anything so boring",                    # Negation with boring - negative
+    "Nothing about this film worked",                   # Nothing negation - negative
+    "Won't recommend this to anyone",                   # Won't negation - negative
+
+    # === CLEAR POSITIVE EXAMPLES ===
+    "This is a great film!",                           # Clear positive
+    "Absolutely fantastic movie experience",            # Strong positive
+    "Love the amazing cinematography and acting",       # Positive with specific praise
+    "Perfect blend of drama and comedy",               # Positive description
+
+    # === CLEAR NEGATIVE EXAMPLES ===
+    "Terrible acting and boring plot",                 # Clear negative
+    "Waste of time and money",                         # Strong negative
+    "Completely disappointing experience",              # Negative experience
+    "The worst movie I've ever seen",                 # Superlative negative
+
+    # === MIXED/NEUTRAL EXAMPLES ===
+    "Not bad, but could be better",                    # Mixed with negation
+    "It was okay, nothing special",                    # Neutral/lukewarm
+    "Good acting but terrible story",                  # Mixed positive/negative
+    "Started well but ended poorly",                   # Mixed temporal sentiment
+
+    # === DOMAIN VARIETY ===
+    "The restaurant food was not good",                # Restaurant + negation
+    "Amazing service and delicious food",              # Restaurant positive
+    "Hotel room was dirty and overpriced",            # Hotel negative
+    "Can't complain about the excellent service",      # Service + double negative
+
+    # === EDGE CASES ===
+    "Not not good",                                    # Double negation edge case
+    "It's not that I don't like it",                  # Complex negation
+    "I love that it's not predictable",               # Positive about negated quality
+    "This doesn't suck",                              # Informal negated negative
+]
+
+predictions = classifier.predict(new_texts)        # Get class predictions
+probabilities = classifier.predict_probability(new_texts)  # Get probability distributions
+
+# Display results with detailed formatting
+for text, pred, prob in zip(new_texts, predictions, probabilities):
+  print(f"Text: '{text}'")
+  print(f"Prediction: {pred}")
+  # Create probability dictionary mapping class names to probabilities
+  prob_dict = dict(zip(classifier.classifier.classes_, prob))
+  print(f"Probabilities: {prob_dict}")
+  print("-" * 50)
 
