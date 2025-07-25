@@ -215,13 +215,132 @@ plt.legend()
 
 plt.show()
 
-"""## Gradient Descent Implementation"""
+"""## Gradient Descent"""
+
+class LogisticRegressionWithGD:
+  def __init__(self, n_features, learning_rate=0.1):
+    self.w = np.zeros(n_features)
+    self.b = 0
+    self.learning_rate = learning_rate
+    self.losses = []
+
+  def forward(self, X):
+    """Compute predictions for batch X"""
+    z = np.dot(X, self.w) + self.b
+    return sigmoid(z) # applying sigmoid element-wise
+
+  def compute_loss(self, X, y):
+    """Compute average cross-entropy loss over batch"""
+    m = len(y) # num of examples
+    y_pred = self.forward(X)
+    epsilon = 1e-15
+    y_pred = np.clip(y_pred, epsilon, 1-epsilon)
+
+    # Average loss: (1/m) * Σ[y*log(ŷ) + (1-y)*log(1-ŷ)]
+    loss = -(1/m) * np.sum( y*np.log(y_pred) + (1-y) * np.log(1-y_pred) )
+    return(loss)
+
+  def compute_gradients(self, X, y):
+    """Compute gradients using vectorized operations."""
+    m = len(y) # Batch size
+    y_pred = self.forward(X) # predictions
+
+    # Gradient of weights: (1/m) * (ŷ - y)ᵀ X
+    # Shape: (n_features,) = (m,) @ (m, n_features)
+    dw = (1/m) *  np.dot((y_pred-y), X)
+
+    # Gradient of bias: (1/m) * Σ(ŷ - y)
+    db = (1/m) * np.sum(y_pred-y)
+
+    print( "dw:", dw, "db: ", db)
+    return( dw,db)
 
 
 
+  def train_step(self, X, y):
+    """One step of gradient descent"""
+
+    # Calc gradients
+    dw,db = self.compute_gradients(X,y)
+
+    # Update params in opposite direction to gradients
+    self.w -= self.learning_rate * dw
+    self.b -= self.learning_rate * db
+
+    # Track loss
+    loss = self.compute_loss(X, y)
+    self.losses.append(loss)
+
+    return loss
+
+# Create synthetic dataset for binary classification
+np.random.seed(42)  # For reproducibility
+n_samples = 1000
+n_features = 2
+
+# Generating 2 classes with diff centers
+X_class0 = np.random.randn(n_samples//2, n_features) - 1.5  # Centered at (-1.5, -1.5)
+X_class1 = np.random.randn(n_samples//2, n_features) + 1.5  # Centered at (1.5, 1.5)
+
+X = np.vstack([X_class0, X_class1]) # Vertical stack
+print( "Vertical Stack: ", X[:5], "\n...", X[-5:])
+
+y = np.hstack([np.zeros(n_samples//2), np.ones(n_samples//2)])  # Labels: 0s then 1s
+print( "Horizontal Stack: ", y[:5], "...", y[-5:])
 
 
+# Shuffle data to mix classes
+indices = np.random.permutation(n_samples)
+X, y = X[indices], y[indices]
 
+print( "X: ", X[:5], "...", X[-5:])
+print( "y: ", y[:5], "...", y[-5:])
+
+
+# Train model
+model = LogisticRegressionWithGD(n_features=2, learning_rate=.1)
+
+# Training
+n_epochs = 100
+for epoch in range(n_epochs):
+  loss = model.train_step(X, y)
+
+  if epoch % 10 == 0:
+    print(f"Epoch {epoch}, Loss: {loss:.4f}")
+
+# Plot results
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+# Plot decision boundary
+h = .02
+x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
+xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
+Z = model.forward(np.c_[xx.ravel(), yy.ravel()])
+Z = Z.reshape(xx.shape)
+
+ax1.contourf(xx, yy, Z, alpha=0.4, cmap='RdYlBu')
+ax1.scatter(X[y==0, 0], X[y==0, 1], c='blue', label='Class 0', alpha=0.6)
+ax1.scatter(X[y==1, 0], X[y==1, 1], c='red', label='Class 1', alpha=0.6)
+ax1.set_xlabel('Feature 1')
+ax1.set_ylabel('Feature 2')
+ax1.set_title('Decision Boundary')
+ax1.legend()
+
+# Plot loss curve
+ax2.plot(model.losses)
+ax2.set_xlabel('Iteration')
+ax2.set_ylabel('Loss')
+ax2.set_title('Training Loss')
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print(f"\nFinal weights: {model.w}")
+print(f"Final bias: {model.b}")
+
+S
 
 
 
