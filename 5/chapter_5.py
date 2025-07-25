@@ -101,15 +101,121 @@ print(f"P(positive|x) = {prob_positive:.2f}")
 print(f"P(negative|x) = {prob_negative:.2f}")
 print(f"Prediction: {'positive' if model.predict(x) == 1 else 'negative'}")
 
+"""##Softmax Function for Multinomial Classification"""
+
+def softmax(z):
+  """
+  Softmax Function for a vector z
+  softmax(z_i) = exp(z_i) / Σ_j exp(z_j)
+  """
+  # Applying normalization to the vector to avoid overflow
+  exp_z = np.exp(z - np.max(z)) # Substracting the top value to apply later a np.exp and use the ratios instead
+  return (exp_z / np.sum(exp_z) ) # Relative distances stay the same
+
+# Example from the textbook
+z = np.array([0.6, 1.1, -1.5, 1.2, 3.2, -1.1])  # Raw scores (logits) for 6 classes
+probabilities = softmax(z)
+
+print("Input z:", z)
+print("Softmax output:", np.round(probabilities, 2))
+print("Sum of probabilities:", np.sum(probabilities))
 
 
 
+### Visualization for 3 classes: both variable values and static
+fig, (ax1, ax2) = plt.subplots(1,2, figsize=(12,5))
+
+### ax1 left plot: one input variates the rest stay fixed
+z_values = np.linspace(-5, 5, 100)
+
+# Matix like [z_value, 0,0]
+z_matrix = np.array([z_values, np.zeros_like(z_values), np.zeros_like(z_values)]).T
+print("z_matrix[:3]")
+print(z_matrix[:3])
+
+probs = np.array([softmax(z_row) for z_row in z_matrix])
+print("probs[:3]:")
+print(probs[:3])
+
+ax1.plot(z_values, probs[:,0], label= "Class 0")
+ax1.plot(z_values, probs[:,1], label= "Class 1")
+ax1.plot(z_values, probs[:,2], label= "Class 2")
+
+ax1.set_xlabel('z[0] value')
+ax1.set_ylabel('Probability')
+ax1.set_title('Softmax: Varying z[0], z[1]=z[2]=0')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+
+### ax2 right plot of constant logitss
+classes = ['Positive', 'Negative', 'Neutral']
+example_z = np.array([2.5, 1.0, -0.5])  # Logits for 3-way sentiment
+example_probs = softmax(example_z)
+
+ax2.bar(classes, example_probs)
+ax2.set_ylabel('Probability')
+ax2.set_title(f'Softmax Example: z = {example_z}')
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+"""## Cross-Entropy Loss Function
+
+"""
+
+def cross_entropy_loss(y_true, y_pred):
+  """
+  Binary Cross-Entropy loss
+  When y=1: only first term matters, when y=0: only second term matters
+  L = -[(part that minimizes loss when the prediction asserts 1 ) + (part that maximizes penalization when the predictions of 1 fails )]
+  L = -[       y * (log(ŷ) )     +     ( (1-y) * log(1-ŷ)     )]
+  """
+
+  epsilon = 1e-15 # for preventing log(0), which outputs as undefined
+  y_pred = np.clip(y_pred, epsilon, 1 -epsilon) # limitting the value so it is defined
+
+
+  return -(y_true * np.log(y_pred) + (1-y_true) * np.log(1-y_pred))
+
+"""## Example from the book"""
+
+y_pred = 0.7
+y_true_positive = 1 # + sentiment
+y_true_negative = 0 # - sentiment
+
+loss_correct = cross_entropy_loss(y_true_positive, y_pred) # Loss when prediction is correct
+loss_incorrect = cross_entropy_loss(y_true_negative, y_pred) # Loss when prediction is incorrect
+
+print(f"Model prediction: {y_pred}")
+print(f"Loss when true label is positive (y=1): {loss_correct:.4f}")
+print(f"Loss when true label is negative (y=0): {loss_incorrect:.4f}")
+
+### Vis
+
+y_pred_range = np.linspace(0.01, 0.99, 100)  # Avoid 0 and 1 for numerical stability, log(0) not def
+loss_when_y1 = cross_entropy_loss(1, y_pred_range)  # Loss curve when true label is 1
+loss_when_y0 = cross_entropy_loss(0, y_pred_range)  # Loss curve when true label is 0
+
+
+plt.figure(figsize=(12,5))
+
+plt.xlabel('Predicted Probability (ŷ)')
+plt.ylabel('Cross-Entropy Loss')
+
+
+plt.plot(y_pred_range, loss_when_y1, label="Loss with y=1", linewidth=2)
+plt.plot(y_pred_range, loss_when_y0, label="Loss with y=0", linewidth=2)
 
 
 
+plt.title('Cross-Entropy Loss Function')
+plt.legend()
 
+plt.show()
 
-
+"""## Gradient Descent Implementation"""
 
 
 
