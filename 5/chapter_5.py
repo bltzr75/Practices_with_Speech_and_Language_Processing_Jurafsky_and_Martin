@@ -102,6 +102,136 @@ print(f"P(positive|x) = {prob_positive:.2f}")
 print(f"P(negative|x) = {prob_negative:.2f}")
 print(f"Prediction: {'positive' if model.predict(x) == 1 else 'negative'}")
 
+"""## Binary Logistic Regression with PyTorch"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+class PyTorchLogisticRegression(nn.Module):
+  """Binary Logistic Regression"""
+
+  def __init__(self, n_features):
+    super(PyTorchLogisticRegression, self).__init__()
+
+    self.linear = nn.Linear(n_features,1) # Linear layer, w.x+b with 1 output for bin classification
+
+  def forward(self, x):
+    """ Forward pass: linear + sigmoid"""
+
+    z = self.linear(x) # Computes w.x+b
+    return torch.sigmoid(z)
+
+  def predict(self, x):
+    """ Binary prediction"""
+
+    with torch.no_grad(): # Disable gradient computation for inference
+      probs = self.forward(x)
+      return(probs > .5).float() # threshold at 0.5
+
+#  optimizer.zero_grad()
+
+# Example: sentiment classification with PyTorch
+print("=== PyTorch Binary Classification ===\n")
+
+# Synthetic data for binary classif
+np.random.seed(42)
+n_samples = 1000
+n_features = 2
+
+# Generation with 2 different centers in the standard distribution
+X_class0 = np.random.randn(n_samples//2, n_features) -1.5 # Centered at (-1.5,-1.5)
+X_class1 = np.random.randn(n_samples//2, n_features) +1.5 # Centered at (+1.5,+1.5)
+
+print(X_class0[:3])
+print(X_class1[:3])
+
+X = np.vstack([X_class0,X_class1]) # Stacking both veritaclly
+y = np.hstack([np.zeros(n_samples//2), np.ones(n_samples//2)])  # Labels: 0s then 1s
+
+print("\n numpy data: X[:5],y[:5]")
+print(X[:5],y[:5])
+
+# Shuffle
+indices = np.random.permutation(n_samples)
+X,y = X[indices], y[indices]
+
+# Converting from numpy to tensors
+X_torch = torch.FloatTensor(X)
+y_torch = torch.FloatTensor(y).view(-1,1) # view and ravel change the dimension, -1 is to infer it
+
+print(X_torch.size())
+print("\npytorch tensors: X_torch[:5], y_torch[:5]")
+print(X_torch[:5], y_torch[:5])
+print("\n")
+
+
+# Create model
+torch_model = PyTorchLogisticRegression(n_features=2)
+print(torch_model)
+
+# Loss function and optiomizer
+criterion = nn.BCELoss()
+optimizer = optim.SGD(torch_model.parameters(), lr=0.1) #SGD
+
+print("\nSGD optimizer: ")
+print(optimizer)
+print("\n")
+
+# Training
+n_epochs = 200
+losses = []
+
+for epoch in range(n_epochs):
+  # Forward pass
+  y_pred = torch_model(X_torch) # get predictions
+
+  # Compute Loss
+  loss = criterion(y_pred, y_torch) # Looks like: "Loss:  tensor(0.9961, grad_fn=<BinaryCrossEntropyBackward0>)"
+  losses.append(loss.item()) # Store loss value
+
+  # Backward pass
+  optimizer.zero_grad() # Clear gradients from prev step
+  loss.backward() # Compute gradients
+  optimizer.step() # Update weights
+
+  if epoch % 10 == 0:
+    print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+
+
+print(losses)
+
+# Visualize decision boundary
+plt.figure(figsize=(10, 5))
+
+# Create grid for decision boundary
+h = 0.02
+x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
+xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
+
+# Make predictions on grid
+grid_points = torch.FloatTensor(np.c_[xx.ravel(), yy.ravel()])
+with torch.no_grad():
+    Z = torch_model(grid_points).numpy()
+Z = Z.reshape(xx.shape)
+
+# Plot
+plt.contourf(xx, yy, Z, alpha=0.4, cmap='RdYlBu')
+plt.scatter(X[y==0, 0], X[y==0, 1], c='blue', label='Class 0', alpha=0.6)
+plt.scatter(X[y==1, 0], X[y==1, 1], c='red', label='Class 1', alpha=0.6)
+plt.xlabel('Feature 1')
+plt.ylabel('Feature 2')
+plt.title('PyTorch Logistic Regression Decision Boundary')
+plt.legend()
+plt.show()
+
+# Print learned parameters
+print("\nLearned parameters:")
+print(f"Weights: {torch_model.linear.weight.data}")
+print(f"Bias: {torch_model.linear.bias.data}")
+
 """##Softmax Function for Multinomial Classification"""
 
 def softmax(z):
