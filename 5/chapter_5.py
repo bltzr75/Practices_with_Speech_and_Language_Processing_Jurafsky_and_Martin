@@ -9,6 +9,7 @@ Original file is located at
 
 import numpy as np
 import matplotlib.pyplot as plt
+from collections import Counter
 
 """## Sigmoid Function"""
 
@@ -516,25 +517,518 @@ for alpha, model in zip(alphas, models):
 ##Integrated Example: Complete Text Classification System
 """
 
+class TextClassifier:
+  """
+  Complete text classifier using log regression
+  Integrates all concepts: features, sigmoid/softmax, loss, gradient descent, regularization
+  """
+
+  def __init__(self, n_classes = 2, learning_rate=0.001, batch_size = 32, alpha = 0.01, max_features=1000):
+    self.n_classes = n_classes
+    self.learning_rate = learning_rate
+    self.batch_size = batch_size
+    self.alpha = alpha
+    self.max_features = max_features
+    self.vocabulary = {}
+    self.W = None # Weight matrix
+    self.b = None # Bias vector
+    self.losses = []
+
+  def extract_features(self, texts):
+    """Conversion of texts to feature vectors"""
+
+    # Build vocabulary if does not exist
+    if not self.vocabulary:
+      word_counts = Counter()
+      for text in texts:
+        words = text.lower().split()
+        word_counts.update(words)
+
+      # Keep most common words
+      most_common = word_counts.most_common(self.max_features)
+      self.vocabulary = {word: idx for idx, (word, _) in enumerate(most_common)}
+
+    # Converting texts to feature vectors
+    n_texts = len(texts)
+    n_features = len(self.vocabulary) + 3 # +3 special features
+    X = np.zeros((n_texts, n_features))
+
+    for i, text in enumerate(texts):
+      words = text.lower().split()
+
+      # Bag of words features
+      for word in words:
+        if word in self.vocabulary:
+          X[i, self.vocabulary[word]] += 1
 
 
+      # Special features from the book
+      X[i, -3] = 1 if '!' in text else 0  # Has exclamation
+      X[i, -2] = 1 if 'no' in text.lower() or 'not' in text.lower() else 0  # Negation
+      X[i, -1] = np.log(len(words) + 1)  # Log word count
+
+    return  X
 
 
+  def softmax(self, z):
+    """Softmax for multiclass and sigmoid for binary"""
+
+    # Sigmoid for binary
+    if self.n_classes == 2:
+      return sigmoid(z[:,1]) # Prob of class 1
+
+    else:
+    # Softmax for multi-classes
+      exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
+      return(exp_z/np.sum(exp_z, axis=1, keepdims=True))
+
+  def forward(self, X):
+    """Forward pass, computes probs"""
+    # Z = XW + b, shape: (batch_size, n_classes)
+    Z = np.dot(X, self.W) + self.b
+    return self.softmax(Z)
+
+  def compute_loss(self, X, y):
+    """Cross-entropy loss with L2 reg"""
+    m = len(y) # Examples size
+    probs = self.forward(X)
+
+    if self.n_classes == 2:
+      # Binary Cross-Entropy
+      epsilon = 1e-15
+      probs = np.clip(probs, epsilon, 1-epsilon) # Avoiding issues with log(0) or log(1) being undefined
+      ce_loss = -(1/m) * np.sum(y * np.log(probs) + (1-y) * np.log(1-probs))
+
+    else:
+      # Multi-class cross-entropy
+      # Creating one-hot encoding of y
+      y_onehot = np.zeros((m, self.n_classes))
+      y_onehot[np.arange(m), y] = 1
+      # print("y_onehot: ", str(y_onehot[:5]))
+
+      epsilon = 1e-15
+      probs = np.clip(probs, epsilon, 1-epsilon) # Avoiding issues with log(0) or log(1) being undefined
+      ce_loss = -(1/m) * np.sum(y_onehot * np.log(probs)) # We just need the left side of the binary case
+
+    # L2 Regularization
+    l2_loss = (self.alpha/(2*m)) * np.sum(self.W**2)
+
+    return ce_loss + l2_loss
 
 
+  def compute_gradients(self, X, y):
+    """ Compute gradients for weights and bias params"""
+    m = len(y)
 
 
+    if self.n_classes == 2:
+      # Binary case
+      probs = self.forward(X)
+      # Gradient for class 1
+      dW1 = (1/m) * np.dot(X.T, (probs - y)) + (self.alpha/m) * self.W[:,1]
+      # Gradietn for class 0
+      dW0 = (1/m) * np.dot(X.T, (y - probs)) + (self.alpha/m) * self.W[:,0]
+
+      dW = np.column_stack([dW0, dW1])
+
+      # Bias gradients
+      db1 = (1/m) * np.sum(probs-y)
+      db = np.array([-db1, db1])
+
+    else:
+      # Multi-class case
+      probs = self.forward(X)
+
+      # One-hot encoded labels
+      y_onehot = np.zeros((m, self.n_classes))
+      y_onehot[np.arange(m), y] = 1
+
+      #Gradients
+      diff = probs - y_onehot # Shape (m, n_classes)
+      dW = (1/m) * np.dot(X.T, diff) + (self.alpha/m) * self.W
+      db = (1/m) * np.sum(diff, axis=0)
+
+    return dW, db
 
 
+  def fit(self, texts, labels, epochs=50, verbose=True):
+    """Train the classifier on texts and labels"""
+
+    #Extract features
+    X = self.extract_features(texts)
+    y = np.array(labels)
+
+    # Initialize weights
+
+    n_features = X.shape[1]
+    if self.W is None:
+      self.W = np.random.randn(n_features, self.n_classes) * 0.01 # Small random init
+      self.b = np.zeros(self.n_classes)
+
+    # Training
+    n_samples = len(y)
+
+    for epoch in range(epochs):
+      # Shuffle
+      indices = np.random.permutation(n_samples)
+      X_shuffled = X[indices]
+      y_shuffled = y[indices]
+
+      epoch_loss = 0
 
 
+      # Mini-batch training
+      for i in range(0, n_samples, self.batch_size):
+        # Get batch
+        batch_end = min(i + self.batch_size, n_samples)
+        X_batch = X_shuffled[i: batch_end]
+        y_batch = y_shuffled[i: batch_end]
 
 
+        # Compute gradients
+        dW, db = self.compute_gradients(X_batch, y_batch)
+
+        # Update parameters
+        self.W -= self.learning_rate * dW
+        self.b -= self.learning_rate * db
 
 
+        # Track Loss
+        batch_loss = self.compute_loss(X_batch, y_batch)
+        epoch_loss += batch_loss * len(y_batch)
+
+      # Avrge epoch loss
+      avg_loss = epoch_loss / n_samples
+      self.losses.append(avg_loss)
+
+      if verbose and epoch % 10 == 0:
+        acc = self.score(texts, labels)
+        print(f"Epoch {epoch}, Loss: {avg_loss:.4f}, Accuracy: {acc:.2%}")
 
 
+  def predict_proba(self, texts):
+      """Get probability predictions for texts"""
+      X = self.extract_features(texts)
+      return self.forward(X)
 
 
+  def predict(self, texts):
+      """Get class predictions for texts"""
+      probs = self.predict_proba(texts)
+
+      if self.n_classes == 2:
+          return (probs > 0.5).astype(int) # Converts to 1s or 0s with .5 threshold
+      else:
+          return np.argmax(probs, axis=1)
 
 
+  def score(self, texts, labels):
+      """Compute accuracy"""
+      predictions = self.predict(texts)
+      return np.mean(predictions == labels)
+
+# Example 1: Binary sentiment classification
+print("=== Binary Sentiment Classification ===")
+
+# Expanded movie review dataset to avoid overfitting
+binary_texts = [
+    # Strong positive reviews
+    "This movie was absolutely fantastic! Best film I've seen all year.",
+    "Loved every minute! Highly recommend to everyone!",
+    "Amazing cinematography and stellar performances!",
+    "Brilliant storytelling! A masterpiece of modern cinema.",
+    "Outstanding! This film deserves every award it gets.",
+    "Phenomenal acting and breathtaking visuals. A must-see!",
+    "Incredible movie! I was captivated from start to finish.",
+    "Absolutely wonderful! This director is a genius.",
+    "Best movie experience I've had in years. Truly exceptional!",
+    "Magnificent! Everything about this film is perfect.",
+    "A triumph! This movie will be remembered for decades.",
+    "Spectacular achievement in filmmaking. Bravo!",
+
+    # Moderate positive reviews
+    "Pretty good movie. Worth watching on a weekend.",
+    "Enjoyable film with some great moments.",
+    "Nice story and decent acting throughout.",
+    "Good entertainment value. Recommended.",
+    "Solid film with strong performances.",
+    "Well-made movie that delivers on its promises.",
+
+    # Strong negative reviews
+    "Terrible waste of time. Do not watch this garbage.",
+    "Boring and predictable. I fell asleep halfway through.",
+    "What a disappointment. Expected so much more.",
+    "Awful movie. One of the worst I've ever seen.",
+    "Complete disaster. Save your money and time.",
+    "Horrible acting and nonsensical plot. Avoid at all costs!",
+    "Painfully bad. I walked out after 30 minutes.",
+    "Absolute trash. How did this get made?",
+    "Dreadful experience. Want my money back!",
+    "Worst movie of the year. Completely unwatchable.",
+    "Total failure on every level. Embarrassingly bad.",
+    "Mind-numbingly boring. A complete waste.",
+
+    # Moderate negative reviews
+    "Not bad, but not great either. Just okay.",
+    "Decent story but poor execution. Could have been better.",
+    "Mediocre at best. Nothing special here.",
+    "Disappointing film that fails to deliver.",
+    "Below average. Many better options available.",
+    "Forgettable movie with weak storyline.",
+
+    # Mixed/neutral reviews (labeled based on overall sentiment)
+    "Has its moments but overall disappointing.",  # negative
+    "Some good parts but mostly boring.",  # negative
+    "Great acting saved an otherwise poor script.",  # positive
+    "Terrible plot but amazing cinematography.",  # negative
+    "Started strong but fell apart in the end.",  # negative
+    "Despite flaws, still entertaining enough.",  # positive
+]
+
+binary_labels = [
+    # Strong positive (12)
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    # Moderate positive (6)
+    1, 1, 1, 1, 1, 1,
+    # Strong negative (12)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # Moderate negative (6)
+    0, 0, 0, 0, 0, 0,
+    # Mixed reviews (6)
+    0, 0, 1, 0, 0, 1
+]
+
+# Split into train/test sets as textbook recommends
+from sklearn.model_selection import train_test_split
+
+X_train_texts, X_test_texts, y_train, y_test = train_test_split(
+    binary_texts, binary_labels, test_size=0.25, random_state=42, stratify=binary_labels
+)
+
+print(f"Training set size: {len(X_train_texts)} examples")
+print(f"Test set size: {len(X_test_texts)} examples")
+print(f"Class distribution - Positive: {sum(binary_labels)}, Negative: {len(binary_labels) - sum(binary_labels)}")
+
+# Train binary classifier with regularization to prevent overfitting
+binary_clf = TextClassifier(
+    n_classes=2,
+    learning_rate=0.1,  # Lower learning rate for stability
+    alpha=0.1,  # Stronger L2 regularization as per Section 5.7
+    batch_size=8  # Smaller batch size for small dataset
+)
+
+# Train on training set only
+binary_clf.fit(X_train_texts, y_train, epochs=100, verbose=True)
+
+# Evaluate on test set
+test_predictions = binary_clf.predict(X_test_texts)
+test_accuracy = np.mean(test_predictions == y_test)
+print(f"\nTest Set Accuracy: {test_accuracy:.2%}")
+
+# Additional evaluation metrics
+train_accuracy = binary_clf.score(X_train_texts, y_train)
+print(f"Training Set Accuracy: {train_accuracy:.2%}")
+
+# Check for overfitting
+if train_accuracy - test_accuracy > 0.1:
+    print("Warning: Model may be overfitting (large train-test gap)")
+else:
+    print("Good generalization (small train-test gap)")
+
+# Test on completely new examples
+new_test_texts = [
+    "This film is an absolute masterpiece! Stunning!",
+    "Completely boring. Fell asleep twice.",
+    "It's okay. Nothing special but watchable."
+]
+
+predictions = binary_clf.predict(new_test_texts)
+probs = binary_clf.predict_proba(new_test_texts)
+
+print("\n=== Predictions on New Examples ===")
+for text, pred, prob in zip(new_test_texts, predictions, probs):
+    sentiment = "Positive" if pred == 1 else "Negative"
+    confidence = prob if pred == 1 else (1 - prob)
+    print(f"Text: '{text}'")
+    print(f"  Prediction: {sentiment} (confidence: {confidence:.2%})\n")
+
+# Multi-class sentiment classification implementation
+print("\n=== Multi-class Sentiment Classification ===")
+
+# Movie review dataset with three sentiment categories
+multi_texts = [
+   # Positive reviews
+   "This movie was absolutely fantastic! Best film ever!",
+   "Loved it! Amazing from start to finish!",
+   "Incredible! A true masterpiece!",
+   "Superb acting and direction. Highly recommended!",
+   "A stunning achievement in cinema. Unforgettable experience!",
+   "Brilliant screenplay with perfect execution!",
+   "One of the best films I've seen this decade!",
+   "Exceptional in every way. A modern classic!",
+   "Breathtaking visuals and powerful storytelling!",
+   "An absolute triumph that exceeds all expectations!",
+   "Masterfully crafted with outstanding performances!",
+   "Pure cinematic magic from beginning to end!",
+
+   # Negative reviews
+   "Terrible waste of time. Absolutely horrible.",
+   "Boring and dull. Fell asleep.",
+   "Awful. One of the worst I've seen.",
+   "Complete disaster from start to finish.",
+   "Painfully bad acting and terrible script.",
+   "An embarrassment to cinema. Avoid this mess.",
+   "Utterly disappointing and poorly executed.",
+   "Waste of talent and resources. Dreadful.",
+   "Incoherent plot with wooden performances.",
+   "A tedious slog that never improves.",
+   "Laughably bad. Not even entertaining as a failure.",
+   "Completely misses the mark on every level.",
+
+   # Neutral reviews
+   "It was okay. Nothing special but watchable.",
+   "Average movie. Some good parts, some bad.",
+   "Decent enough. Worth a watch if you're bored.",
+   "Neither great nor terrible. Just adequate.",
+   "Passable entertainment for a slow evening.",
+   "Has its moments but overall unremarkable.",
+   "Standard fare. Nothing particularly memorable.",
+   "Competent but uninspiring filmmaking.",
+   "A mixed bag with equal strengths and weaknesses.",
+   "Serviceable but forgettable. Middle of the road.",
+   "Fair attempt that neither excels nor fails.",
+   "Acceptable viewing but nothing groundbreaking."
+]
+
+# Labels: 0=negative, 1=neutral, 2=positive
+multi_labels = [
+   2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,  # positive
+   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # negative
+   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1   # neutral
+]
+
+# Data splitting for proper evaluation
+from sklearn.model_selection import train_test_split
+
+train_texts, test_texts, train_labels, test_labels = train_test_split(
+   multi_texts, multi_labels, test_size=0.3, random_state=42, stratify=multi_labels
+)
+
+print(f"Dataset size: {len(multi_texts)} reviews")
+print(f"Training set: {len(train_texts)} reviews")
+print(f"Test set: {len(test_texts)} reviews")
+print(f"Class distribution: Positive={multi_labels.count(2)}, Negative={multi_labels.count(0)}, Neutral={multi_labels.count(1)}")
+
+# Initialize and train classifier
+multi_clf = TextClassifier(
+   n_classes=3,
+   learning_rate=0.2,
+   alpha=0.05,
+   batch_size=12
+)
+
+print("\nTraining multi-class classifier...")
+multi_clf.fit(train_texts, train_labels, epochs=150, verbose=True)
+
+# Model evaluation on test set
+test_predictions = multi_clf.predict(test_texts)
+test_accuracy = np.mean(test_predictions == test_labels)
+train_accuracy = multi_clf.score(train_texts, train_labels)
+
+print(f"\nModel Performance:")
+print(f"Training Accuracy: {train_accuracy:.2%}")
+print(f"Test Accuracy: {test_accuracy:.2%}")
+print(f"Generalization Gap: {(train_accuracy - test_accuracy):.2%}")
+
+# Confusion matrix analysis
+from sklearn.metrics import confusion_matrix
+cm = confusion_matrix(test_labels, test_predictions)
+print("\nConfusion Matrix:")
+print("       Neg  Neu  Pos")
+for i, row in enumerate(cm):
+   label = ["Neg", "Neu", "Pos"][i]
+   print(f"{label}:    {row}")
+
+# Test on new examples
+evaluation_texts = [
+   "Outstanding performance! Brilliant cinematography and acting!",
+   "Terrible acting and plot. Complete waste of time.",
+   "Fine for what it is. Not amazing but not terrible either.",
+   "A masterpiece of modern cinema! Absolutely loved it!",
+   "Boring beyond belief. Couldn't finish watching.",
+   "Has good and bad elements. Overall pretty average."
+]
+
+predictions = multi_clf.predict(evaluation_texts)
+probabilities = multi_clf.predict_proba(evaluation_texts)
+
+print("\nClassification Results on New Reviews:")
+sentiment_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
+
+for idx, (text, pred, probs) in enumerate(zip(evaluation_texts, predictions, probabilities)):
+   print(f"\nReview {idx+1}: {text}")
+   print(f"Classification: {sentiment_map[pred]}")
+   print(f"Confidence scores: Negative={probs[0]:.3f}, Neutral={probs[1]:.3f}, Positive={probs[2]:.3f}")
+
+# Visualization of training dynamics
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Loss curve
+axes[0].plot(multi_clf.losses, linewidth=2, color='darkblue')
+axes[0].set_xlabel('Epoch', fontsize=12)
+axes[0].set_ylabel('Loss', fontsize=12)
+axes[0].set_title('Multi-class Training Loss', fontsize=14)
+axes[0].grid(True, alpha=0.3)
+
+# Class probability distribution for test examples
+bar_width = 0.25
+x_pos = np.arange(len(evaluation_texts[:3]))
+
+axes[1].bar(x_pos - bar_width, probabilities[:3, 0], bar_width, label='Negative', color='crimson', alpha=0.8)
+axes[1].bar(x_pos, probabilities[:3, 1], bar_width, label='Neutral', color='gray', alpha=0.8)
+axes[1].bar(x_pos + bar_width, probabilities[:3, 2], bar_width, label='Positive', color='forestgreen', alpha=0.8)
+
+axes[1].set_xlabel('Test Example', fontsize=12)
+axes[1].set_ylabel('Probability', fontsize=12)
+axes[1].set_title('Class Probability Distribution', fontsize=14)
+axes[1].set_xticks(x_pos)
+axes[1].set_xticklabels(['Example 1', 'Example 2', 'Example 3'])
+axes[1].legend()
+axes[1].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+# Feature importance analysis
+print("\n=== Feature Importance Analysis ===")
+
+# Extract weights for each class
+vocab_size = len(multi_clf.vocabulary)
+feature_names = list(multi_clf.vocabulary.keys()) + ['exclamation', 'negation', 'log_length']
+
+for class_idx, class_name in enumerate(['Negative', 'Neutral', 'Positive']):
+   print(f"\n{class_name} Class Indicators:")
+
+   # Get weights for this class
+   class_weights = multi_clf.W[:, class_idx]
+
+   # Create feature-weight pairs
+   feature_importance = [(feature_names[i], class_weights[i])
+                        for i in range(len(class_weights))]
+
+   # Sort by absolute weight
+   feature_importance.sort(key=lambda x: abs(x[1]), reverse=True)
+
+   # Display top features
+   print("  Top contributing features:")
+   for feature, weight in feature_importance[:8]:
+       if abs(weight) > 0.01:  # Only show meaningful weights
+           print(f"    {feature}: {weight:+.3f}")
+
+# Statistical summary
+print("\nWeight Statistics:")
+print(f"Total parameters: {multi_clf.W.size + multi_clf.b.size}")
+print(f"Average weight magnitude: {np.mean(np.abs(multi_clf.W)):.4f}")
+print(f"Weight standard deviation: {np.std(multi_clf.W):.4f}")
+
+"""#### The implementation is working correctly - the 100% accuracy is expected with such a small dataset. The model is memorizing rather than generalizing. It is overfitting the small data, it should be trained with larger datasets."""
