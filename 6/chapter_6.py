@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict, Counter
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
 """##Word-Document and Word-Word Matrices"""
@@ -97,7 +98,8 @@ def compute_tf_idf(term_doc_matrix):
 
   return pd.DataFrame(tf_idf, index=term_doc_matrix.index, columns=term_doc_matrix.columns)
 
-compute_tf_idf(term_doc_matrix)
+tf_idf_matrix = compute_tf_idf(term_doc_matrix)
+tf_idf_matrix
 
 """## Word-Word Co-occurrence (Association)
 
@@ -188,9 +190,146 @@ def compute_ppmi(cooc_matrix, alpha = 0.75):
 
 compute_ppmi(cooc_matrix, alpha = 0.75)
 
+"""## Cosine Similarity"""
+
+def cosine_similarity(vec1, vec2):
+  """
+  Compute cosine similarity between two vectors
+  Dot product divide by the product of the Norms of both to normalize them
+  cosine(v1, v2) = (v1 . v2) / (|v1| x |v1|)
+  """
+
+  dot_prod = np.dot(vec1, vec2)
+
+  magnitude1 = np.sqrt(np.sum(vec1**2))
+  magnitude2 = np.sqrt(np.sum(vec2**2))
+
+  # Prevent div by zero
+  if magnitude1 == 0 or magnitude2 == 0: return 0
+
+  return np.dot(vec1,vec2)/ (magnitude1 * magnitude2)
+
+"""### Usecase for Cosine Similarity"""
+
+def find_similar_words(word,matrix,top_n=3):
+  """Finds the most similar words to a target word."""
+
+  if word not in matrix.index:
+    return([])
+
+  target_vector = matrix.loc[word].values # Convert to pandas series
+  similarities = []
+
+  for other_word in matrix.index:
+    if other_word != word:
+      other_vector = matrix.loc[other_word].values
+      sim = cosine_similarity(target_vector,other_vector)
+      similarities.append((other_word, sim))
+
+  similarities.sort(key=lambda x:x[1], reverse=True)  # Sort by similarity in descending order
+
+  return similarities[:top_n]
+
+find_similar_words('battle', tf_idf_matrix, 3)
+
+"""##Simple Word2Vec Implementation (Skip-gram concept)"""
+
+def sigmoid(x):
+    """Sigmoid activation function: σ(x) = 1 / (1 + e^(-x))"""
+    return 1 / (1 + np.exp(-x))
+
+class SkipGram:
+  """Simplified Skipgram"""
+
+  def __init__(self, vocab_size, embedding_dim=10):
+    # Random initialization multiplied by small value
+    self.W = np.random.randn(vocab_size, embedding_dim) * 0.1
+    self.C = np.random.randn(vocab_size, embedding_dim) * 0.1
+    self.vocab_size = vocab_size
+
+  def forward(self, target_idx, context_idx):
+    "Conpute P(context_word|target_word)"
+
+    # Get embeddings by indexing into matrices
+    target_embedding = self.W[target_idx]
+    context_embedding = self.W[context_idx]
+
+    # Dot product and sigmoid
+    dot_product = np.dot(target_embedding, context_embedding)
+    probability = sigmoid(dot_product)
+
+    return probability
+
+  def train_pair(self, target_idx, context_idx, label, learning_rate=0.01):
+    """
+    Train on a single target-context pair.
+    label: 1 for positive (real context), 0 for negative (noise)
+    """
+
+    # Forward pass
+    prob = self.forward(target_idx, context_idx)
+
+    gradient  = (prob-label) # derivative of loss w.r.t. activation
+
+    # Update embeddings with gradient descent
+    self.W[target_idx] -= learning_rate * gradient * self.C[context_idx]
+    self.C[target_idx] -= learning_rate * gradient * self.W[target_idx]
+
+    print("")
+    print(self.W[target_idx], self.C[target_idx] )
+    print("")
+
+"""### Usecase of SkipGram"""
+
+vocab = ['battle', 'good', 'fool', 'wit', 'love']
+
+vocab_to_idx = {word: idx for idx,word in enumerate(vocab)}
+print(vocab_to_idx)
+
+model = SkipGram(len(vocab), embedding_dim=5)
+
+print("\nTraining Skip-gram:")
+print("Initial embedding for 'battle':", model.W[vocab_to_idx['battle']].round(3))
 
 
+for _ in range(20):
+  model.train_pair(vocab_to_idx['battle'], vocab_to_idx['good'], 1) # Positive example: 'battle' appears with 'good'
+  model.train_pair(vocab_to_idx['battle'], vocab_to_idx['love'], 0) # Negative example: 'battle' doesn't appear with 'love'
 
+print("Updated embedding for 'battle':", model.W[vocab_to_idx['battle']].round(3))
 
+"""###  Visualization of Embeddings with t-SNE"""
 
+def visualize_embeddings(embeddings, labels):
+  """Visualize high-dimensional embedding in two dimensions with t-Distributed Stochastic Neighbor Embedding"""
+
+  # Reducing dimensionality to 2 with t-SNE
+  if embeddings.shape[1] > 2 and embeddings.shape[0] > 5: # Checking that there are enough samples
+    # Adjust perplexity based on number of samples
+    ppl = min(30,embeddings.shape[0]-1) # 30 is the default, but must be < n_samples
+    tsne = TSNE(n_components = 2, random_state=42, perplexity=ppl)
+    embeddings_2d = tsne.fit_transform(embeddings)
+  else:
+    embeddings_2d = embeddings[:,:2] # Takes just 2 first dimensions
+
+  print(embeddings_2d)
+
+  plt.figure(figsize=(10,8))
+  plt.scatter(embeddings_2d[:,0], embeddings_2d[:,1])
+
+  # Adding labels
+  for i,label in enumerate(labels):
+    plt.annotate(label, (embeddings_2d[i, 0], embeddings_2d[i, 1]), xytext=(5, 5), textcoords='offset points')
+
+  plt.title("Word Embeddings")
+  plt.xlabel("Dim 1")
+  plt.ylabel("Dim 2")
+  plt.grid(True, alpha=.3)
+  plt.show()
+
+if ppmi_matrix.shape[0]>0:
+  print("Visualizing word embeddings from PPMI matrix")
+  embeddings = ppmi_matrix.values
+  labels = ppmi_matrix.index.tolist()
+  visualize_embeddings(embeddings, labels)
 
