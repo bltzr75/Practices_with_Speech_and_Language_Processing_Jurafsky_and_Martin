@@ -23,8 +23,6 @@ documents = {
     "Henry V": "battle battle battle battle good wit war king england"
 }
 
-
-
 def create_term_document_matrix(documents):
   """ Creates term-document matrix
   Rows represent words (terms)
@@ -56,6 +54,64 @@ def create_term_document_matrix(documents):
   df = pd.DataFrame(matrix,
                     index=vocab,
                     columns=list(documents.keys()))
+
+  return df
+
+term_doc_matrix = create_term_document_matrix(documents)
+print("\n", term_doc_matrix)
+
+"""## TF-IDF
+
+"""
+
+def compute_tf_idf(term_doc_matrix):
+  """Compute Term Frequency × Inverse Document Frequency"""
+
+  matrix = term_doc_matrix.values # Convert to numpy.ndarray to apply np.where easily
+
+  n_docs = matrix.shape[1]
+
+  print(np.where(matrix>0, 1,0))
+
+  # Term freq
+  tf = np.where(matrix > 0, 1 + np.log10(matrix), 0) #
+  print("\nTerm Freq:\n", tf, "\n")
+
+  # Doc freq (words appearing on how many docs)
+  df = np.sum(matrix>0, axis=1)
+  print("\nDoc Freq:\n", df, "\n")
+
+  # Inverse doc freq
+  idf = np.log10(n_docs/df)
+  print("\nInverse Doc Freq without log(10):\n", n_docs/df, "\n")
+
+  print("\nInverse Doc Freq (with log(10)):\n", idf, "\n")
+
+
+  # TF-IDF
+  idf = idf[:, np.newaxis] # Flatten idf
+  print("\nBroadcasted Inverse Doc Freq to dimensionality (n,1):\n", idf, "\n")
+
+  tf_idf = tf*idf
+  print("\nTF-IDF:\n", idf, "\n")
+
+  return pd.DataFrame(tf_idf, index=term_doc_matrix.index, columns=term_doc_matrix.columns)
+
+compute_tf_idf(term_doc_matrix)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
