@@ -74,7 +74,7 @@ def compute_tf_idf(term_doc_matrix):
   print(np.where(matrix>0, 1,0))
 
   # Term freq
-  tf = np.where(matrix > 0, 1 + np.log10(matrix), 0) #
+  tf = np.where(matrix > 0, 1 + np.log10(matrix + 1e-10), 0) # Raw counts can be misleading (100 occurrences isn't 100x more important than 1), for taht reason we compress it with the log10. Also, added small epsilon to avoid log(0) and warning
   print("\nTerm Freq:\n", tf, "\n")
 
   # Doc freq (words appearing on how many docs)
@@ -99,17 +99,94 @@ def compute_tf_idf(term_doc_matrix):
 
 compute_tf_idf(term_doc_matrix)
 
+"""## Word-Word Co-occurrence (Association)
+
+"""
+
+def create_word_cooccurrence_matrix(documents, window_size=2):
+  cooccurrence = defaultdict(lambda: defaultdict(int))
+
+  for doc in documents.values():
+    words = doc.split()
+
+    for i, target_word in enumerate(words):# print(i,target_word)
+
+      start = max(0, i - window_size) # Sets the start of the context window so it is not below 0
+      end = min(len(words), i + window_size + 1) # Sets the end of the context window so it is not above the last word
+      print("Word ", target_word, "has a window with indexes range ", start, "-", end, "\n")
+
+      for j in range(start,end):
+        if i != j:                  # Not counting the word with itself
+
+          context_word = words[j]
+          cooccurrence[target_word][context_word] += 1
+
+      print("cooccurrence: ", cooccurrence)
 
 
+  # all_words = []
+  # for doc in documents.values():
+  #   for word in doc.split(): all_words.append(word)
+  # sorted(set(all_words))
+
+  all_words = sorted(set(word for doc in documents.values() for word in doc.split(" ")  )) # Same as above but in a set comprehension
+  print("\nall_words: ", all_words)
+
+  matrix = []
+  for target_word in all_words:
+    row = []
+    for ctxt_word in all_words:
+      row.append(cooccurrence[target_word][ctxt_word])
+    matrix.append(row)
+
+  return pd.DataFrame(matrix, index = all_words, columns = all_words)
+
+cooc_matrix = create_word_cooccurrence_matrix(documents, window_size=2)
+cooc_matrix
+
+"""## PPMI (Positive Pointwise Mutual Information)"""
+
+def compute_ppmi(cooc_matrix, alpha = 0.75):
+  """
+  Compute PPMI matrix from the Co-occurrence matrix.
+  alpha = 0.75: Levy et al. (2015) found that a setting of α = 0.75 improved performance of embeddings on a wide range of tasks
+  0.75 increases the probability assigned to rare contexts, and hence lowers their PMI (Pα(c) > P(c) when c is rare).
+  """
+
+  matrix = cooc_matrix.values.astype(float)
+
+  total = np.sum(matrix)
 
 
+  # Joint probabilities P(w,c)
+  # Element-wise division by scalar
+  p_wc = matrix / total
+  print("\n p_wc: \n", p_wc, "\n")
+
+  # Getting marginal probabilities
+  p_w = np.sum(matrix, axis=1) / total
+  p_c = np.sum(matrix, axis=0) / total # Although it is the same bcs it is a symmetric co-occurrence matrix
 
 
+  # Smoothing and re-normalizing
+  p_c_alpha = np.power(p_c, alpha)
+  p_c_alpha = p_c_alpha / np.sum(p_c_alpha)
+
+  for i,j,k in zip(cooc_matrix.index, p_w, p_c_alpha):print(i,j,round(k,4)) ## p_w = p_c because it is a symmetric matrix, with the power to alpha that changes
 
 
+  # Calculate PMI
+  epsilon = 1e-10 #Added small epsilon to avoid division by zero and log(0)
 
+  pmi = np.log2((p_wc + epsilon)/
+              (p_w[:,np.newaxis] * p_c_alpha[np.newaxis,:]+epsilon)) # Broadcasting p_w to dimension (1,n)
+  print("\n PMI: \n", pmi, "\n")
 
+  # Convert to PPMI (turn negatives to zero)
+  ppmi = np.maximum(0,pmi)
+  return pd.DataFrame(ppmi, index=cooc_matrix.index, columns=cooc_matrix.columns)
 
+compute_ppmi(cooc_matrix, alpha = 0.75)
 
 
 
