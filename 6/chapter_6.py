@@ -7,12 +7,36 @@ Original file is located at
     https://colab.research.google.com/drive/1ttzOxJg4Re0lkrpoUTdNI06EFIb4e-_7
 """
 
+# !pip install gensim spacy transformers chromadb sentence-transformers -q
+# !python -m spacy download en_core_web_md -q
+
+
+# ## In Colab: Restart session to avoid issues, specially with gensim
+
 import numpy as np
 import pandas as pd
 from collections import defaultdict, Counter
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
+
+import gensim
+from gensim.models import Word2Vec
+
+import spacy
+
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+import nltk
+# Download NLTK data quietly
+nltk.download('punkt', quiet=True)  # Punkt tokenizer for sentence splitting
+nltk.download('brown', quiet=True)  # Brown corpus for training data
+from nltk.corpus import brown # for Word2Vec training with gensim
+
+
 
 """##Word-Document and Word-Word Matrices"""
 
@@ -188,7 +212,10 @@ def compute_ppmi(cooc_matrix, alpha = 0.75):
   ppmi = np.maximum(0,pmi)
   return pd.DataFrame(ppmi, index=cooc_matrix.index, columns=cooc_matrix.columns)
 
-compute_ppmi(cooc_matrix, alpha = 0.75)
+
+
+ppmi_matrix = compute_ppmi(cooc_matrix, alpha = 0.75)
+ppmi_matrix
 
 """## Cosine Similarity"""
 
@@ -332,4 +359,204 @@ if ppmi_matrix.shape[0]>0:
   embeddings = ppmi_matrix.values
   labels = ppmi_matrix.index.tolist()
   visualize_embeddings(embeddings, labels)
+
+"""### Word2Vec (with Gensim lib instead, common approach)
+
+"""
+
+# Using brown corpus
+sentences = brown.sents()#[:10000]
+print(sentences[:1000])
+
+# Training Word2Vec
+model = Word2Vec(
+    sentences = sentences,
+    vector_size = 100, # Embedding dimensionality
+    window = 5,
+    min_count = 5, # Ignoring words with frequency < 5
+    workers = 4, # Parallel threads
+    sg = 1, # Skip-gram (1) or Continuous Bag-of-Words (0)
+    negative = 5, # Negative samples per each positive
+    epochs = 10 # iters over the whole corpus
+)
+
+print("\nMost similar words to 'man':")
+similar_words = model.wv.most_similar('man', topn=5)
+for word, similarity in similar_words:
+    print(f"  {word}: {similarity:.3f}")
+### Interesting results
+
+print("\nMost similar words to 'Christ':")
+similar_words = model.wv.most_similar('Christ', topn=5)
+for word, similarity in similar_words:
+    print(f"  {word}: {similarity:.3f}")
+
+# Word analogies
+print("\nWord analogy: father - man + woman = ?")
+# positive: words to add, negative: words to subtract
+result = model.wv.most_similar(positive=['father', 'woman'], negative=['man'], topn=1)
+print(f"  Result: {result[0][0]} (similarity: {result[0][1]:.3f})")
+# Probably needs more data in the corpus
+
+# Word analogies
+print("\nWord analogy: queen - woman + man = ?")
+# positive: words to add, negative: words to subtract
+result = model.wv.most_similar(positive=['queen', 'man'], negative=['woman'], topn=1)
+print(f"  Result: {result[0][0]} (similarity: {result[0][1]:.3f})")
+
+"""### Visualization in 2D with PCA"""
+
+def plot_word_vectors(model, words):
+  """Plot word vectors in 2-D with Princpal Component Analysis"""
+
+  word_vectors = np.array([model.wv[word] for word in words if word in model.wv])
+  word_labels = [word for word in words if word in model.wv]
+
+  print("word_vectors shpae:", word_vectors.shape)
+  print("word_vectors[:5,:5]: \n", str(word_vectors[:5,:5]))
+  print("word_labels: \n", word_labels)
+
+
+  # Reducing dimensionality to just 2-D with PCA
+  pca = PCA(n_components = 2)
+  vectors_2d = pca.fit_transform(word_vectors)
+
+  print("vectors_2d with PCA:\n", vectors_2d)
+
+  # Plot
+  plt.figure(figsize=(10,8))
+  plt.scatter(vectors_2d[:,0], vectors_2d[:,1])
+  plt.title("Word2Vec Embeddings with PCA projection into 2-D")
+  plt.grid(True, alpha =.3)
+
+  for i, word in enumerate(word_labels):
+    plt.annotate(word, xy=(vectors_2d[i,0], vectors_2d[i,1]), xytext=(5, 5), textcoords='offset points')
+
+  plt.show()
+
+words_to_plot = ['brave', 'fear', 'devil', 'hero' ,'monster','doctor','faith', 'eternal', 'health','king', 'queen', 'man', 'woman', 'prince', 'princess', 'boy', 'girl', 'father', 'mother', 'god', 'noise_asdfasdf', 'power', 'money',  'glory', 'God', 'Son', 'Jesus', 'Christ']
+plot_word_vectors(model, words_to_plot)
+
+"""## TF-IDF with Scikit-learn"""
+
+# Sample documents
+documents = [
+    "The quick brown fox jumps over the lazy dog",
+    "A quick brown dog outpaces a quick fox",
+    "The lazy cat sleeps all day long",
+    "Machine learning is fascinating and powerful",
+    "Deep learning revolutionized natural language processing",
+    "Natural language processing helps computers understand human language"
+]
+
+# TF-IDF vectorizer
+vectorizer = TfidfVectorizer(
+    max_features = 100, # Max vocab size
+    ngram_range = (1,2), # Use unigrams and bigrams (1-word and 2-word phrases)
+    stop_words = 'english', # Removing English stopwords
+    lowercase = True, # Converts to lowercase
+    use_idf = True,   # IDF weighting
+    smooth_idf = True, # Add-1 (Laplace) Smoothing
+    sublinear_tf = True # Uses log(tf) instead of just tf
+)
+
+# vectorizer
+
+# Fit and trasnform docs
+tfidf_matrix = vectorizer.fit_transform(documents)
+feature_names = vectorizer.get_feature_names_out()
+
+print("tfidf_matrix[1]\n")
+for i in tfidf_matrix[1]: print(i)
+
+print("feature_names:\n ",feature_names)
+
+tfidf_df = pd.DataFrame(
+  tfidf_matrix.toarray(),
+  columns=feature_names,
+  index=[f"Doc{i}" for i in range(len(documents))]
+)
+
+print("\ntfidf_df.iloc[1][:20]\n")
+print(tfidf_df.iloc[1][:20])
+
+print("TF-IDF Matrix shape:", tfidf_matrix.shape)
+print("\nTop terms by TF-IDF score in first document:")
+doc_tfidf = tfidf_df.iloc[0]  # First doc
+top_terms = doc_tfidf.nlargest(5)  # Get 5 largest values
+for term, score in top_terms.items():
+  print(f"  {term}: {score:.3f}")
+
+"""### Document similarity on the tfidf_matrix
+
+"""
+
+from sklearn.metrics.pairwise import cosine_similarity # Cosine similarity from the lib
+
+print("\nDocument similarity matrix:")
+similarity_matrix = cosine_similarity(tfidf_matrix)
+similarity_df = pd.DataFrame(
+  similarity_matrix,
+  index=[f"Doc{i}" for i in range(len(documents))],
+  columns=[f"Doc{i}" for i in range(len(documents))]
+)
+print(similarity_df.round(3))
+
+def find_similar_documents(doc_id, similarity_matrix, documents, top_n=2):
+  """Find documents most similar to a given document."""
+  similarities = similarity_matrix[doc_id]
+  print("\nsimilarities:\n", similarities, "\n")
+
+  similar_indices = np.argsort(similarities)[::-1][1:top_n+1] # argsort() returns indices that would sort array
+  print("\nnp.argsort(similarities):", np.argsort(similarities), "\n")
+
+  print(f"\nDocuments similar to: '{documents[doc_id]}'")
+  for idx in similar_indices:
+      print(f"  Similarity {similarities[idx]:.3f}: '{documents[idx]}'")
+
+
+find_similar_documents(4, similarity_matrix, documents)
+
+"""# Embeddings with SpaCy (a bit more modern)
+
+### Written in Cython, spaCy is optimized for performance, enabling fast processing of large volumes of text data.
+"""
+
+## !python -m spacy download en_core_web_md -q
+
+
+# Load the model
+nlp = spacy.load("en_core_web_md")
+print(dir(nlp))
+
+# Process text and get word vectors
+text = "The quick brown fox jumps over the lazy dog"
+
+doc = nlp(text)
+print(doc)
+
+print("spaCy Word Vectors:")
+print(f"Vector dimension: {doc[0].vector.shape[0]}")  # First token's vector dimension
+
+
+# Word similarity using spaCy
+# Process individual words
+word1 = nlp("king")
+word2 = nlp("queen")
+word3 = nlp("car")
+
+print(f"\nWord similarities:")
+# .similarity() method computes cosine similarity
+print(f"  king - queen: {word1.similarity(word2):.3f}")
+print(f"  king - car: {word1.similarity(word3):.3f}")
+
+"""## Contextual Embeddings with Transformers (more modern)"""
+
+
+
+
+
+
+
+
 
