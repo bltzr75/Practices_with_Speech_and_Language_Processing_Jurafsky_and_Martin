@@ -9,7 +9,7 @@ Original file is located at
 
 !pip install gensim spacy transformers chromadb sentence-transformers -q
 # !python -m spacy download en_core_web_md -q
-
+!pip install PyPDF2 pdfplumber
 
 # ## In Colab: Restart session to avoid issues, specially with gensim
 
@@ -874,4 +874,122 @@ for method, info in comparison.items():
   print(f"  Type: {info['type']}")
   print(f"  First 5 values: {np.array(info['values']).round(3)}")
   print()
+
+"""## Usecase: PDF Question Answering with Semantic Search
+
+### Download chapter from the book
+"""
+
+# !wget https://web.stanford.edu/~jurafsky/slp3/6.pdf # Easiest way
+
+# More python way
+import requests
+url = "https://web.stanford.edu/~jurafsky/slp3/6.pdf"
+
+resp = requests.get(url)
+
+with open("6.pdf", "wb") as fh:
+  fh.write(resp.content)
+
+"""### Specific libs for this usecase"""
+
+import PyPDF2
+import pdfplumber # Better for complex pdfs
+import re
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+import textwrap
+
+"""### Creating Class
+
+"""
+
+class PDFSemanticSearch:
+  """Semantic Search Engine for PDF documents."""
+
+  def __init__(self, embedding_model='all-MiniLM-L6-v2'):
+    self.model = SentenceTransformer(embedding_model)
+    self. paragraphs = []
+    self.embeddings = None
+    self.metadata = []
+    self.full_text = "" # Keeping the complete text for reference
+
+
+  def extract_text_from_pdf(self,pdf_path):
+    """PDF text extraction with multiple methods""" # using just PyPDF2 was not enough
+    print(f"Reading PDF: {pdf_path}")
+    all_text = []
+
+    try:
+      # Method 1: pdfplumber, better for complex layouts
+      with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+          text = page.extract_text() or ""
+          if text.strip():
+            all_text.append({
+                'text': text,
+                'page': page_num + 1,
+                'method': 'pdfplumber'
+            })
+
+    except Exception as e:
+      print(f"pdfplumber failed :( \nError: {e} ")
+
+    # Method 2: PyPDF2 as fallback if required
+    if not all_text:
+      print("Falling back to PyPDF2")
+      with open(pdf_path, 'rb') as fh:
+        pdf_reader = PyPDF2.PdfReader(fh)
+        for page_num in range(len(pdf_reader.pages)):
+          page = pdf_reader.pages[page_num]
+          text = page.extract_text()
+          if text.strip():
+            all_text.append({
+                'text': text,
+                'page': page_num + 1,
+                'method': 'PyPDF2'
+            })
+
+    # Store full text for reference
+    self.full_text = "\n\n".join([page['text'] for page in all_text ])
+    return(all_text)
+
+
+  def clean_text(self, text):
+    """Clean and normalize the extracted text."""
+
+    # Common pdf extraction issues
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text) # Adding space btwn camelCase
+    text = re.sub(r'(?<=[a-zA-Z])(?=[0-9])', ' ', text) # Add space between letter and number
+    text = re.sub(r'(?<=[0-9])(?=[a-zA-Z])', ' ', text)
+    text = re.sub(r'([a-z])([.!?,;:])([a-zA-Z])', r'\1\2 \3', text)  # Fix words that are concatenated with punctuation
+    text = re.sub(r'\s+', ' ' , text) # Normalize whitespaces
+    text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text) # Fixing hyphenated words
+    text = re.sub(r'([.!?])\s*\n', r'\1 ', text)  # Fix sentence breaks
+
+
+
+    # Remove excessive spaces but preserving paragraphs structure
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+      line = line.strip()
+      if line:
+        cleaned_lines.append(line)
+
+    return '\n'.join(cleaned_lines)
+
+pdf_search = PDFSemanticSearch()
+pdf_path = "6.pdf"
+a = pdf_search.extract_text_from_pdf(pdf_path)
+b = pdf_search.clean_text(a[4]["text"])
+b
+
+
+
+
+
+type(a)
 
