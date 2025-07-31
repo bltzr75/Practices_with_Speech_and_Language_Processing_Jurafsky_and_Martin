@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1ttzOxJg4Re0lkrpoUTdNI06EFIb4e-_7
 """
 
-# !pip install gensim spacy transformers chromadb sentence-transformers -q
+!pip install gensim spacy transformers chromadb sentence-transformers -q
 # !python -m spacy download en_core_web_md -q
 
 
@@ -29,6 +29,8 @@ import spacy
 
 from transformers import AutoTokenizer, AutoModel
 import torch
+from torchinfo import summary
+from torchviz import make_dot
 
 import nltk
 # Download NLTK data quietly
@@ -512,7 +514,7 @@ def find_similar_documents(doc_id, similarity_matrix, documents, top_n=2):
 
   print(f"\nDocuments similar to: '{documents[doc_id]}'")
   for idx in similar_indices:
-      print(f"  Similarity {similarities[idx]:.3f}: '{documents[idx]}'")
+    print(f"  Similarity {similarities[idx]:.3f}: '{documents[idx]}'")
 
 
 find_similar_documents(4, similarity_matrix, documents)
@@ -552,11 +554,108 @@ print(f"  king - car: {word1.similarity(word3):.3f}")
 
 """## Contextual Embeddings with Transformers (more modern)"""
 
+print("Loading BERT") # Requires using the HF_TOKEN, I have it loaded on colab
+model_name = "bert-base-uncased"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name) # AutoTokenizer automatically loads the correct tokenizer for that model
+
+model = AutoModel.from_pretrained(model_name) # AutoModel loads the model architecture and weights
+
+# for i in dir(model):print(i)
+
+# Key architecture details
+print(f"Hidden size: {model.config.hidden_size}")
+print(f"Num layers: {model.config.num_hidden_layers}")
+print(f"Num attention heads: {model.config.num_attention_heads}")
+print(f"Vocab size: {model.config.vocab_size}")
+print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+print("\n========== LISTING THE LAYERS ========\n")
+# List all layers
+for name, module in model.named_modules():
+    print(f"{name}: {module.__class__.__name__}")
+print("\n==================\n")
+
+print("\n")
+print(model)
+
+print("\n=== MODEL SUMMARY ===\n")
+# Create actual input tensors for BERT
+dummy_tokens = torch.randint(0, 1000, (1, 128))  # Random token IDs
+summary(model, input_data={'input_ids': dummy_tokens},
+        col_names=['input_size', 'output_size', 'num_params'],
+        depth=3)
+print("\n==================\n")
+
+# Making downloadable viz of the arch of the model
+print("\n=== CREATING COMPUTATION GRAPH ===\n")
+dummy_input = tokenizer("Hello world", return_tensors="pt")
+outputs = model(**dummy_input)
+graph = make_dot(outputs.last_hidden_state.mean(), params=dict(model.named_parameters()))
+graph.render("bert_graph", format="png")
+print("Graph saved as bert_graph.png")
+
+def get_bert_embeddings(text):
+  """ Get BERT embeddings for a text."""
+
+  # tokenize and prepare inputs
+  inputs = tokenizer(
+      text,
+      return_tensors="pt", # python tensors
+      padding = True, # pads to same length
+      truncation = True, # Truncates to max length
+      max_length = 512
+  )
 
 
+  # Get token IDs and convert back to tokens
+  token_ids = inputs['input_ids'][0]  # Get first sequence
+  tokens = tokenizer.convert_ids_to_tokens(token_ids)
+  for i in range(min(20, len(tokens))):
+    print(f"{i}: {token_ids[i]:5d} -> '{tokens[i]}'")
 
 
+  with torch.no_grad(): # inference mode to get embeddings, no need on computing gradients
+    outputs = model(**inputs) # unpacking dicts as kwards
 
+
+  # Extracting embeddings
+  sentence_embedding = outputs.last_hidden_state[:, 0, :].numpy() # last_hidden_state shape: (batch_size, sequence_length, hidden_size). The [:, 0, :] selects CLS token (sentence representation)
+  print("\nsentence_embedding[:,:10]\n")
+  print(sentence_embedding[:,:10])
+  print("\n")
+
+  # Mean Pooling: averaging all the token embeddigns
+  mean_embedding = outputs.last_hidden_state.mean(dim=1).numpy()
+  print("\nmean_embedding[:,:10]\n")
+  print(mean_embedding[:,:10])
+  print("\n")
+
+  return sentence_embedding[0], mean_embedding[0]
+
+
+sentences = [
+    "The bank is by the river",
+    "I need to go to the bank to deposit money",
+    "The river bank is muddy"
+]
+
+embeddings = []
+
+for sentence in sentences:
+  cls_emb, mean_emb = get_bert_embeddings(sentence)
+  embeddings.append(mean_emb)
+  print(f"\nSentence: '{sentence}', with shape: {mean_emb.shape}. First 5 values: {mean_emb[:5].round(3)}.\n")
+
+# Compute similarities
+from sklearn.metrics.pairwise import cosine_similarity
+similarity_matrix = cosine_similarity(embeddings)
+
+print("\nContextual similarity matrix:\n")
+for i in range(len(sentences)):
+  for j in range(i+1, len(sentences)):
+    print(f" '{sentences[i]}' vs '{sentences[j]}':"
+          f"{similarity_matrix[i,j]:.4f}" )
 
 
 
