@@ -8,7 +8,8 @@ Original file is located at
 """
 
 !pip install gensim spacy transformers chromadb sentence-transformers -q
-# !python -m spacy download en_core_web_md -q
+!python -m spacy download en_core_web_md -q
+!pip install torchinfo torchviz -q
 !pip install PyPDF2 pdfplumber
 
 # ## In Colab: Restart session to avoid issues, specially with gensim
