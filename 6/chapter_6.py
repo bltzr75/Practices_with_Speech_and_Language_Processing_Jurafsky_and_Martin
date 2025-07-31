@@ -35,13 +35,14 @@ from torchviz import make_dot
 import chromadb
 from chromadb.utils import embedding_functions
 
+from sentence_transformers import SentenceTransformer
+import time
+
 import nltk
 # Download NLTK data quietly
 nltk.download('punkt', quiet=True)  # Punkt tokenizer for sentence splitting
 nltk.download('brown', quiet=True)  # Brown corpus for training data
 from nltk.corpus import brown # for Word2Vec training with gensim
-
-
 
 """##Word-Document and Word-Word Matrices"""
 
@@ -773,4 +774,104 @@ filtered_results = collection.query(
 )
 
 for doc, dist in zip(filtered_results['documents'][0], filtered_results['distances'][0]) : print(f"{dist:.4f} - {doc}")
+
+"""## Comparing Different Embedding Methods"""
+
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
+import time
+import spacy
+
+# Load required models
+st_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Requires using the HF_TOKEN, I have it loaded on colab
+model_name = "bert-base-uncased"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name) # AutoTokenizer automatically loads the correct tokenizer for that model
+
+model = AutoModel.from_pretrained(model_name) # AutoModel loads the model architecture and weights
+
+
+# Load spaCy model
+try:
+    nlp = spacy.load("en_core_web_sm")
+except:
+    !python -m spacy download en_core_web_sm
+    nlp = spacy.load("en_core_web_sm")
+
+# RENAME Word2Vec model to avoid conflict
+from gensim.models import Word2Vec
+sample_sentences = [["machine", "learning", "is", "great"],
+                   ["computers", "process", "information", "fast"]]
+w2v_model = Word2Vec(sentences=sample_sentences, vector_size=100, window=5, min_count=1)  # Changed name!
+
+def compare_embedding_methods(text):
+  """Comparing different embedding methods for the same text"""
+
+  results = {}
+
+  # TF-IDF
+  sample_docs = [text, "Just another document", "And one more as yapa"]
+  tfidf_vec = TfidfVectorizer(max_features = 50) # Dimensions
+  tfidf_matrix = tfidf_vec.fit_transform(sample_docs)
+  results['TF-IDF'] = {
+      'dimension': tfidf_matrix.shape[1],
+      'type': 'sparse',
+      'values': tfidf_matrix[0].toarray()[0][:5] # Just first 5 vals
+  }
+
+
+  # Word2Vec
+  words = text.lower().split()
+  valid_words = [w for w in words if w in w2v_model.wv] # Only existing words in the vocabulary
+  print("valid_words", valid_words)
+  if valid_words:
+    # Average word vectors
+    w2v_embedding = np.mean([w2v_model.wv[w] for w in valid_words], axis = 0)
+    results['Word2Vec'] = {
+      'dimension': len(w2v_embedding),
+      'type': 'dense',
+      'values': w2v_embedding[:5] # Just first 5 vals
+  }
+
+
+  # spaCy
+  spacy_doc = nlp(text)
+  results['spaCy'] = {
+    'dimension': len(spacy_doc.vector),
+    'type': 'dense',
+    'values': spacy_doc.vector[:5]
+  }
+
+  st_embedding = st_model.encode(text)
+  results['Sentence-Transformer'] = {
+    'dimension': len(st_embedding),
+    'type': 'dense',
+    'values': st_embedding[:5]
+  }
+
+  results['BERT'] = {
+    'dimension': len(mean_emb),
+    'type':'dense, contextual',
+    'values': mean_emb[:5]
+  }
+
+  return results
+
+
+
+
+# Compare diff methods
+test_text = "Machine learning transforms how computers process information"
+print(f"Comparing embeddings for: '{test_text}'\n")
+
+comparison = compare_embedding_methods(test_text)
+for method, info in comparison.items():
+  print(f"{method}:")
+  print(f"  Dimension: {info['dimension']}")
+  print(f"  Type: {info['type']}")
+  print(f"  First 5 values: {np.array(info['values']).round(3)}")
+  print()
 
