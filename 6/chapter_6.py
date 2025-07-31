@@ -32,6 +32,9 @@ import torch
 from torchinfo import summary
 from torchviz import make_dot
 
+import chromadb
+from chromadb.utils import embedding_functions
+
 import nltk
 # Download NLTK data quietly
 nltk.download('punkt', quiet=True)  # Punkt tokenizer for sentence splitting
@@ -600,11 +603,11 @@ def get_bert_embeddings(text):
 
   # tokenize and prepare inputs
   inputs = tokenizer(
-      text,
-      return_tensors="pt", # python tensors
-      padding = True, # pads to same length
-      truncation = True, # Truncates to max length
-      max_length = 512
+    text,
+    return_tensors="pt", # python tensors
+    padding = True, # pads to same length
+    truncation = True, # Truncates to max length
+    max_length = 512
   )
 
 
@@ -634,10 +637,48 @@ def get_bert_embeddings(text):
   return sentence_embedding[0], mean_embedding[0]
 
 
+# Test sentences showcasing different linguistic phenomena
 sentences = [
-    "The bank is by the river",
-    "I need to go to the bank to deposit money",
-    "The river bank is muddy"
+  # Polysemy: "bank" (financial vs. river)
+  "The bank is by the river",
+  "I need to go to the bank to deposit money",
+  "The river bank is muddy",
+  "She works at the central bank",
+  "The boat docked at the river bank",
+  "My bank account is overdrawn",
+
+  # Polysemy: "bat" (animal vs. sports equipment)
+  "The bat flew out of the cave at dusk",
+  "She swung the bat and hit a home run",
+  "Bats sleep hanging upside down",
+  "He bought a new cricket bat",
+  "The vampire bat feeds on blood",
+
+  # Context changes meaning: "light"
+  "The feather is very light",
+  "Please turn on the light",
+  "She wore a light blue dress",
+  "Light travels faster than sound",
+  "This suitcase feels light",
+  "The room needs more light",
+
+  # Synonyms in different contexts
+  "The doctor prescribed medicine for my cold",
+  "The physician recommended medication for my illness",
+  "The surgeon performed the operation",
+  "The medic treated the wounded soldier",
+
+  # Idioms vs. literal meaning
+  "It's raining cats and dogs outside",
+  "The cats and dogs are playing together",
+  "Break a leg at your performance tonight",
+  "He literally broke his leg skiing",
+
+  # Technical vs. common usage
+  "I need to debug this Python code",
+  "The bug crawled across the keyboard",
+  "The software has a critical bug",
+  "I found a bug in my salad"
 ]
 
 embeddings = []
@@ -657,5 +698,79 @@ for i in range(len(sentences)):
     print(f" '{sentences[i]}' vs '{sentences[j]}':"
           f"{similarity_matrix[i,j]:.4f}" )
 
+"""##ChromaDB for Embedding Storage and Retrieval
 
+"""
+
+# Sample documents to index
+documents = [
+    "Machine learning is a subset of artificial intelligence",
+    "Deep learning uses neural networks with multiple layers",
+    "Natural language processing helps computers understand text",
+    "Computer vision enables machines to interpret visual information",
+    "Reinforcement learning trains agents through rewards and penalties",
+    "Transfer learning reuses knowledge from pre-trained models",
+    "Unsupervised learning finds patterns without labeled data",
+    "Supervised learning requires labeled training examples"
+]
+
+client = chromadb.PersistentClient(path="/content/chroma_db")  # Initialize persisting client
+
+# Create embedding function
+sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+      model_name = "all-MiniLM-L6-v2")
+
+# Create or get collections
+try:
+  collection = client.get_collection(
+      name="document_embeddings",
+      embedding_function = sentence_transformer_ef
+      )
+  print("Loading existing collection")
+except:
+  collection = client.create_collection(
+      name="document_embeddings",
+      embedding_function = sentence_transformer_ef,
+      metadata = {"description": "Document embedding for semantic search"}
+  )
+  print("Creating collection")
+
+
+# Check existence of docs before addign
+existing_count = collection.count()
+if existing_count == 0:
+  # Adding if empty
+  collection.add(         # In collection.add() uses plurals for the params
+    documents = documents,
+    metadatas = [{"source": f"doc_{i}", "category":"AI/ML"}
+                for i in range(len(documents))],
+    ids = [f"doc_{i}" for i in range(len(documents))]
+  )
+  print(f"Added {len(documents)} documents")
+else:
+  print(f"Collection already has {existing_count} documents")
+
+
+# Perform semantic search
+print("\nSemantic Search:\n")
+query = "How do neural networks learn from examples?"
+results = collection.query(    # query() finds most similar documents
+    query_texts=[query],
+    n_results = 3
+)
+
+for i, (doc, distance) in enumerate(zip(results['documents'][0], results['distances'][0])):
+  print(f"{i+1}. Distance: {distance:.4f}. {doc}")
+
+print("\n")
+
+# Advanced search with metadata filtering
+print("\n\nFiltered search (category='AI/ML'):\n")
+filtered_results = collection.query(
+    query_texts = ["What is learning without labels?"],
+    n_results = 2,
+    where = {"category": "AI/ML"} # Filtering by metadata
+)
+
+for doc, dist in zip(filtered_results['documents'][0], filtered_results['distances'][0]) : print(f"{dist:.4f} - {doc}")
 
