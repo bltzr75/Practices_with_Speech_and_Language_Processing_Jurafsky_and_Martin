@@ -35,6 +35,8 @@ from torchviz import make_dot
 import chromadb
 from chromadb.utils import embedding_functions
 
+import textwrap
+
 from sentence_transformers import SentenceTransformer
 import time
 
@@ -124,7 +126,7 @@ def compute_tf_idf(term_doc_matrix):
   print("\nBroadcasted Inverse Doc Freq to dimensionality (n,1):\n", idf, "\n")
 
   tf_idf = tf*idf
-  print("\nTF-IDF:\n", idf, "\n")
+  print("\nTF-IDF:\n", tf_idf, "\n")
 
   return pd.DataFrame(tf_idf, index=term_doc_matrix.index, columns=term_doc_matrix.columns)
 
@@ -285,7 +287,7 @@ class SkipGram:
 
     # Get embeddings by indexing into matrices
     target_embedding = self.W[target_idx]
-    context_embedding = self.W[context_idx]
+    context_embedding = self.C[context_idx]
 
     # Dot product and sigmoid
     dot_product = np.dot(target_embedding, context_embedding)
@@ -304,9 +306,14 @@ class SkipGram:
 
     gradient  = (prob-label) # derivative of loss w.r.t. activation
 
+    # Store original values before updating
+    w_original = self.W[target_idx].copy()
+    c_original = self.C[context_idx].copy()
+
     # Update embeddings with gradient descent
-    self.W[target_idx] -= learning_rate * gradient * self.C[context_idx]
-    self.C[target_idx] -= learning_rate * gradient * self.W[target_idx]
+    # ∂L/∂W[target] = gradient * C[context]
+    self.W[target_idx] -= learning_rate * gradient * c_original
+    self.C[context_idx] -= learning_rate * gradient * w_original
 
     print("")
     print(self.W[target_idx], self.C[target_idx] )
@@ -728,14 +735,13 @@ try:
       embedding_function = sentence_transformer_ef
       )
   print("Loading existing collection")
-except:
+except Exception as e:
   collection = client.create_collection(
       name="document_embeddings",
       embedding_function = sentence_transformer_ef,
       metadata = {"description": "Document embedding for semantic search"}
   )
-  print("Creating collection")
-
+  print(f"Creating new collection: {e}")
 
 # Check existence of docs before addign
 existing_count = collection.count()
@@ -826,6 +832,8 @@ def compare_embedding_methods(text):
   # Word2Vec
   words = text.lower().split()
   valid_words = [w for w in words if w in w2v_model.wv] # Only existing words in the vocabulary
+  if not valid_words:
+    print(f"Warning: No valid words found for Word2Vec from: {words}")
   print("valid_words", valid_words)
   if valid_words:
     # Average word vectors
@@ -851,6 +859,8 @@ def compare_embedding_methods(text):
     'type': 'dense',
     'values': st_embedding[:5]
   }
+
+  cls_emb, mean_emb = get_bert_embeddings(text)
 
   results['BERT'] = {
     'dimension': len(mean_emb),
@@ -915,7 +925,7 @@ class PDFSemanticSearch:
     self.embeddings = None
     self.metadata = []
     self.full_text = "" # Keeping the complete text for reference
-
+    self.sections = []
 
   def extract_text_from_pdf(self,pdf_path):
     """PDF text extraction with multiple methods""" # using just PyPDF2 was not enough
@@ -969,8 +979,6 @@ class PDFSemanticSearch:
     text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text) # Fixing hyphenated words
     text = re.sub(r'([.!?])\s*\n', r'\1 ', text)  # Fix sentence breaks
 
-
-
     # Remove excessive spaces but preserving paragraphs structure
     lines = text.split('\n')
     cleaned_lines = []
@@ -981,15 +989,359 @@ class PDFSemanticSearch:
 
     return '\n'.join(cleaned_lines)
 
+
+  def split_into_chunks(self, pdf_text, chunk_size=500, overlap=50):
+    """
+    Split text into overlapping chunks for context preservation.
+    chunk_size: target size of each chunk in chars.
+    overlap: number of chars to overlap between chunks.
+    """
+    chunks = []
+
+
+    for page_data in pdf_text:
+      text = self.clean_text(page_data['text'])
+      page_num = page_data['page']
+
+      # First try to split by paragraphs
+      paragraphs = re.split(r'\n\s*\n|\n(?=[A-Z])', text)
+
+      current_chunk = ""
+      for para in paragraphs:
+        para = para.strip()
+
+        # if the paragraph is too long, split it further
+        if len(para) > chunk_size:
+          #split by sentencse
+          sentences = re.split(r'(?<=[.!?])\s+', para)
+          for sent in sentences:
+            if len(current_chunk) + len(sent) > chunk_size and current_chunk:
+              chunks.append({
+                  'text': current_chunk.strip(),
+                  'page': page_num,
+                  'length': len(current_chunk)
+              })
+              # Keep overlap
+              current_chunk = current_chunk[-overlap:] + " " + sent
+            else:
+              current_chunk += " " + sent
+
+        # if adding paragraph does not exceed the chunk size
+        elif len(current_chunk) + len(para) <= chunk_size:
+          current_chunk += "\n" + para if current_chunk else para
+
+
+        # If exceeds the chunk size, save current chunk and start a new one
+        else:
+          if current_chunk:
+            chunks.append({
+                'text': current_chunk.strip(),
+                'page': page_num,
+                'length': len(current_chunk)
+            })
+          current_chunk = para
+
+      # Last chunk
+      if current_chunk.strip():
+          chunks.append({
+              'text': current_chunk.strip(),
+              'page': page_num,
+              'length': len(current_chunk)
+          })
+
+    return chunks
+
+
+  def extract_sections(self, text):
+    """ Extract section headers and structure from text."""
+
+    # Common section patterns for pdfs
+    section_patterns = [
+      r'^(\d+\.?\d*)\s+([A-Z][A-Za-z\s]+)$',  # Example: "6.1 Lexical Semantics"
+      r'^([A-Z][A-Za-z\s]+):$',  # Example "Introduction:"
+      r'^#{1,3}\s*(.+)$',  #  ###Markdown style headers
+    ]
+
+    sections = []
+    for pattern in section_patterns:
+      matches = re.finditer(pattern, text, re.MULTILINE) # re.MULTILINE modifies the behavior of the ^ (caret) and $ (dollar sign) anchors, acting also after the new lines \n
+      for match in matches:
+        sections.append({
+          'title': match.group(0).strip(),
+          'start': match.start(),
+          'level': match.group(1) if match.lastindex > 1 else '0'
+        })
+
+    return(sorted(sections, key=lambda x: x['start']))
+
+
+
+  def index_pdf(self, pdf_path, chunk_size=500):
+    """Extract and index chunks from the pdf with processing"""
+
+    # Extract text from the pdf
+    pdf_text = self.extract_text_from_pdf(pdf_path)
+
+    if not pdf_text:
+      raise ValueError("No text could be extracted from the PDF.")
+
+
+    # Extract sections for better context
+    self.sections = self.extract_sections(self.full_text)
+    print(f"Found {len(self.sections)} sections in the document")
+
+    # Split into chunks
+    chunk_data = self.split_into_chunks(pdf_text, chunk_size=chunk_size)
+
+    # Extract text and metadata
+    self.paragraphs = [c['text'] for c in chunk_data]
+    self.metadata = []
+
+    for i, chunk in enumerate(chunk_data):
+      # Find which section this chunk belongs to
+      chunk_start = self.full_text.find(chunk['text'][:50])
+      section = "Unknown"
+      for s in reversed(self.sections):
+        if s['start'] <= chunk_start:
+          section = s['title']
+          break
+
+      self.metadata.append({
+          'page': chunk['page'],
+          'length': chunk['length'],
+          'section': section,
+          'index': i
+      })
+
+    print(f"\nCreated {len(self.paragraphs)} chunks")
+    print(f"Average chunk size: {np.mean([m['length'] for m in self.metadata]):.0f} characters")
+    print("Creating embeddings...")
+
+    # Create the embeddings
+    self.embeddings = self.model.encode(
+        self.paragraphs,
+        show_progress_bar = True,
+        batch_size = 32,
+        convert_to_numpy=True
+    )
+
+    print("Indexing complete!")
+
+  def search(self, query, top_k=5, threshold=0.25, rerank=True):
+    """Search with optional reranking"""
+
+    if self.embeddings is None:
+      raise ValueError("No documents indexed. Use index_pdf() first.")
+
+
+    # Encode query
+    query_embedding = self.model.encode([query], convert_to_numpy=True) # np.argsort(similarities) - Gets indices that would sort the array (ascending). top_k*2 candidates if reranking is enabled (to have more options for reranking), so if top_k=5 and rerank=True, it gets the indices of the 10 most similar chunks, which will later be reranked and trimmed to 5.
+
+    # Compute similarities
+    similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+
+    # Get top candidates
+    top_indices = np.argsort(similarities)[::-1][:top_k*2 if rerank else top_k]
+
+    results = []
+    for idx in top_indices:
+      score = similarities[idx]
+      if score >= threshold:
+        results.append({
+            'paragraph': self.paragraphs[idx],
+            'score': score,
+            'page': self.metadata[idx]['page'],
+            'section': self.metadata[idx]['section'],
+            'index':idx
+        })
+
+    # Rerank based on additional factors
+    if rerank and results:
+      results = self._rerank_results(results, query)
+
+    return(results[:top_k])
+
+  def _rerank_results(self, results, query):
+    """Rerank results based on additional criteria: exact matches in the text/section/title."""
+
+    query_terms = set(query.lower().split())  # LowerCase and split to match exactly the query with the text
+
+    for result in results:
+      text_lower = result['paragraph'].lower() # LowerCase to match exactly the query with the text
+
+      # Boost score for exact term matches
+      term_matches = sum(1 for term in query_terms if term in text_lower)
+
+      # Boost for title/section matches
+      section_boost = 0.1 if any(term in result['section'].lower()
+                                for term in query_terms) else 0
+
+      # Combine scores
+      result['final_score'] = result['score'] + (term_matches * 0.05) + section_boost
+
+    # Sort by final score
+    return sorted(results, key=lambda x: x['final_score'], reverse=True)
+
+  def answer_question(self, question, top_k=3, show_context=True):
+    """ Question answering"""
+
+    print(f"\n{'='*80}")
+    print(f"Question: {question}")
+    print(f"{'='*80}\n")
+
+    # Searching for relevant chunks
+    results = self.search(question, top_k=top_k)
+
+    if not results:
+      print("No relevant content found. Review your question, pal.")
+      return None
+
+    print(f"Found {len(results)} relevant passages:\n")
+
+    # Display results
+    for i, result in enumerate(results, 1):
+      print(f"Result {i} (Page {result['page']}, Score: {result['score']:.3f})")
+      print(f"Section: {result['section']}")
+      print("-" * 60)
+
+      # Format and display text
+      text = result['paragraph']
+
+      # Highlight query terms
+      highlighted_text = self._highlight_terms(text, question)
+
+      # Wrap text for better readability
+      wrapped_lines = textwrap.wrap(highlighted_text, width=80)
+      for line in wrapped_lines:
+          print(line)
+
+      print("\n")
+
+      # Show surrounding context if requested
+      if show_context and i==1: # For the top result only
+        self._show_context(result['index'])
+
+
+    return(results)
+
+  def _highlight_terms(self, text, query):
+    """Highlight query terms in text."""
+    # Extract important terms from query
+    stop_words = {'what', 'is', 'the', 'how', 'does', 'are', 'in', 'of', 'to', 'a', 'an'}
+    query_terms = [term.lower() for term in query.split()
+                  if term.lower() not in stop_words and len(term) > 2]
+
+    # Highlight each term
+    for term in query_terms:
+      # Case-insensitive replacement with word boundaries
+      pattern = re.compile(rf'\b{re.escape(term)}\b', re.IGNORECASE)
+      text = pattern.sub(lambda m: f"**{m.group().upper()}**", text)
+
+    return text
+
+  def _show_context(self, index, window=1):
+    """Show surrounding context for a result."""
+    print("\n Extended Context:")
+    print("-" * 60)
+
+    # Get surrounding chunks
+    start_idx = max(0, index - window)
+    end_idx = min(len(self.paragraphs), index + window + 1)
+
+    for i in range(start_idx, end_idx):
+      if i == index:
+        print(">>> MAIN PASSAGE <<<")
+      else:
+        print(f"[Context from page {self.metadata[i]['page']}]")
+
+      wrapped = textwrap.wrap(self.paragraphs[i], width=80)
+
+      for line in wrapped[:3]:  # Show first 3 lines of context
+        print(line)
+      if len(wrapped) > 3:
+        print("...")
+      print()
+
+  def get_section_summary(self):
+    """Get a summary of document sections."""
+    if not self.sections:
+      return "No sections found."
+
+    print("\n Document Structure:")
+    print("=" * 60)
+
+    current_level = None
+    for section in self.sections[:20]:  # Show first 20 sections
+      level = section.get('level', '0')
+      indent = "  " * (len(level.split('.')) - 1)
+      print(f"{indent}{section['title']}")
+
+    if len(self.sections) > 20:
+      print(f"... and {len(self.sections) - 20} more sections")
+
+
+
+# Create enhanced search engine
 pdf_search = PDFSemanticSearch()
+
+# Index the PDF
 pdf_path = "6.pdf"
-a = pdf_search.extract_text_from_pdf(pdf_path)
-b = pdf_search.clean_text(a[4]["text"])
-b
+pdf_search.index_pdf(pdf_path, chunk_size=600)
 
+# Show document structure
+pdf_search.get_section_summary()
 
+# Interactive mode with improved features
+def enhanced_interactive_qa():
+  """Enhanced interactive Q&A with helpful features."""
+  print("\n" + "="*80)
+  print(" Enhanced PDF Q&A System")
+  print(" Commands: 'help', 'sections', 'search [term]', 'quit'")
+  print("="*80)
 
+  while True:
+    user_input = input("\nAsk a question (or command): ").strip()
 
+    if user_input.lower() in ['quit', 'exit', 'q']:
+      print("Goodbye!")
+      break
 
-type(a)
+    elif user_input.lower() == 'help':
+      print("\nAvailable commands:")
+      print(" - Ask any question about the content")
+      print(" - 'sections': Show document structure")
+      print(" - 'search [term]': Search for specific term")
+      print(" - 'quit': Exit the system")
 
+    elif user_input.lower() == 'sections':
+      pdf_search.get_section_summary()
+
+    elif user_input.lower().startswith('search '):
+      search_term = user_input[7:]
+      print(f"\nSearching for '{search_term}'...")
+      results = pdf_search.search(search_term, top_k=3)
+      if results:
+        print(f"Found {len(results)} results containing '{search_term}'")
+        for i, r in enumerate(results, 1):
+          print(f"\n{i}. Page {r['page']}, Section: {r['section']}")
+          print(f" Preview: {r['paragraph'][:100]}...")
+
+    elif user_input:
+      pdf_search.answer_question(user_input)
+
+    else:
+      print("Please enter a question or command.")
+
+# Run enhanced interactive mode
+enhanced_interactive_qa()
+
+# Example questions about Chapter 6 content
+questions = [
+    "What is the distributional hypothesis?",
+    "How does Word2Vec skip-gram work?",
+    "What is the difference between sparse and dense embeddings?",
+    "How do we compute cosine similarity between vectors?",
+    "What is PPMI and how is it calculated?",
+    "What are the problems with bias in embeddings?",
+    "How does TF-IDF weighting work?"
+]
