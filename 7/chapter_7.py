@@ -196,3 +196,224 @@ print(f"z = w·x + b = {neural_unit.z:.3f}")
 print(f"Input shape: {x.shape}")
 print(f"Output: {z}")
 
+"""# The XOR Problem
+
+## Perceptron
+### Demonstrating that a single perceptron cannot solve XOR
+"""
+
+def perceptron(x, w, b):
+  """Simple perceptron with step activation"""
+  z = np.dot(x,w) + b
+
+  return(1 if z > 0 else 0 )
+
+
+# XOR Truth Table
+X_xor = np.array([[0,0], [0,1], [1,0], [1,1]]) # the 4 possible combinations
+
+y_xor = np.array([0,1,1,0]) # XOR outputs
+
+# AND Truth Table
+y_and = np.array([0,0,0,1]) # AND outputs
+
+# OR Truth Table
+y_or = np.array([0,1,1,1]) # OR outputs
+
+
+# Visualize problem
+fig, axes = plt.subplots(1,3, figsize=(15,5) ) # 1 row, 3 cols
+
+for ax, y, title in zip(axes, [y_and, y_or, y_xor], ['AND', 'OR', 'XOR']):
+  # Plot points
+  for i in range(4):
+    color = 'red' if y[i] == 1 else 'blue'
+    marker = 'o' if y[i] == 1 else 'x'
+    ax.scatter(X_xor[i, 0], X_xor[i, 1], c=color, s=200, marker=marker)
+
+  ax.set_xlim(-.5,1.5)
+  ax.set_ylim(-.5,1.5)
+  ax.set_ylabel('x2')
+  ax.set_title(f'{title} Function')
+  ax.grid(True, alpha=0.3)
+
+  # Adding Decision Boundaries
+  if title=='AND':
+    # Decision boundary: x1 + x2 - 1.5 = 0
+    x_line = np.linspace(-0.5, 1.5, 100)
+    y_line = 1.5 - x_line
+    ax.plot(x_line, y_line, 'g--', label='Decision boundary')
+  elif title == 'OR':
+    # Decision boundary: x1 + x2 - 0.5 = 0
+    x_line = np.linspace(-0.5, 1.5, 100)
+    y_line = 0.5 - x_line
+    ax.plot(x_line, y_line, 'g--', label='Decision boundary')
+
+  if title != 'XOR':
+    ax.legend()
+
+plt.show()
+
+"""## Notes about `@` vs `np.dot()` vs `*`
+
+The `@` operator in Python/NumPy is the **matrix multiplication operator**:
+
+
+```python
+import numpy as np
+
+A = np.array([[1, 2], [3, 4]])
+B = np.array([[5, 6], [7, 8]])
+v = np.array([1, 2])
+
+# Matrix multiplication
+A @ B       # Same as np.matmul(A, B)
+np.dot(A, B)  # Also matrix multiplication for 2D arrays
+
+# Element-wise multiplication  
+A * B       # Different! Multiplies corresponding elements
+```
+
+## How `@` Behaves with Different Dimensions
+
+### 1. **Matrix × Matrix** → Matrix multiplication (Row × Column)
+```python
+[[1, 2]    [[5, 6]     [[19, 22]
+ [3, 4]] @  [7, 8]]  =  [43, 50]]
+```
+
+### 2. **Matrix × Vector** → Matrix-vector multiplication
+```python
+[[1, 2]    [5]     [1×5 + 2×6]     [17]
+ [3, 4]] @ [6]  =  [3×5 + 4×6]  =  [39]
+```
+
+### 3. **Vector × Vector** → Dot product (scalar)
+```python
+[1, 2] @ [3, 4] = 1×3 + 2×4 = 11  # Returns scalar!
+```
+
+## Solving XOR with Neural Network
+"""
+
+class XORNetwork:
+  """
+  2-layer network to solve the XOR Problem
+  2 inputs -> 2 hidden units -> 1 output
+  """
+
+  def __init__(self):
+    # Hidden layer weights (example from the book originally from Bengio)
+
+    """
+    NumPy's @ operator (or np.dot) automatically treats the 1D array x as a column vector:
+    [[1, 1]    [[0]     [[1×0 + 1×0]     [[0]
+    [1, 1]] @  [0]]  =  [1×0 + 1×0]]  =  [0]]
+
+    For input [0, 0]:
+    Row 1: 1×0 + 1×0 = 0
+    Row 2: 1×0 + 1×0 = 0
+    Result: [0, 0]
+
+    For input [1, 1]:
+    Row 1: 1×1 + 1×1 = 2
+    Row 2: 1×1 + 1×1 = 2
+    Result: [2, 2]
+    """
+
+    self.W1 = np.array([[1,1],   # weights for h1
+                        [1,1]])  # weights for h2
+
+    self.b1 = np.array([0,-1])
+
+    self.W2 = np.array([[1,-2]])
+    self.b2 = np.array([0])
+
+  def forward(self,x):
+    # Hidden layer with ReLU
+
+    self.z1 = np.dot(self.W1,x) + self.b1  # NumPy's @ operator (or np.dot) automatically treats the 1D array x as a column vector
+    print(f"z1 = {self.W1}@{x} + {self.b1}")
+
+    # W1 @ x: (2,2) @ (2,) → (2,) - returns a 1D array
+    # Example: [[1,1],[1,1]] @ [1,1] → [2, 2] (vector)
+
+
+    self.h = relu(self.z1)
+    print(f"h = {self.h}")
+
+    # Output layer (linear)
+    self.z2 = np.dot(self.W2, self.h) + self.b2
+    print(f"z2 = {self.W2}@{self.h} + {self.b2}")
+
+    # W2 @ h: (1,2) @ (2,) → (1,) - returns a 1D array with one element
+    # Example: [[1,-2]] @ [2,1] → [0] (
+
+
+    print(f"z2 = {self.z2}")
+    self.y = self.z2[0]   #  We use the [0] to extract the scalar from the array
+    print("\n\n")
+    return(self.y)
+
+  def predict(self,x):
+    """Binary prediction with threshold at 0"""
+
+    return (self.forward(x) > 0).astype(int)
+
+"""### Test XOR network
+
+"""
+
+xor_net = XORNetwork()
+
+print("XOR Network Predictions:")
+print("-" * 30)
+for i, x in enumerate(X_xor):
+  prediction = xor_net.predict(x)
+  print(f"Input: {x} -> Predicted: {prediction}, True: {y_xor[i]}")
+
+# Visualize hidden layer representations
+hidden_representations = []
+for x in X_xor:
+  xor_net.forward(x)
+  hidden_representations.append(xor_net.h)
+
+hidden_representations = np.array(hidden_representations)
+
+plt.figure(figsize=(10, 5))
+
+# Original space
+plt.subplot(1, 2, 1)
+for i in range(4):
+  color = 'red' if y_xor[i] == 1 else 'blue'
+  marker = 'o' if y_xor[i] == 1 else 'x'
+  plt.scatter(X_xor[i, 0], X_xor[i, 1], c=color, s=200, marker=marker)
+plt.xlabel('x1')
+plt.ylabel('x2')
+plt.title('Original Input Space')
+plt.grid(True, alpha=0.3)
+
+# Hidden layer space
+plt.subplot(1, 2, 2)
+for i in range(4):
+  color = 'red' if y_xor[i] == 1 else 'blue'
+  marker = 'o' if y_xor[i] == 1 else 'x'
+  plt.scatter(hidden_representations[i, 0], hidden_representations[i, 1],c=color, s=200, marker=marker)
+  plt.annotate(f'({X_xor[i,0]},{X_xor[i,1]})', (hidden_representations[i, 0], hidden_representations[i, 1]), xytext=(5, 5), textcoords='offset points')
+
+h1_range = np.linspace(-0.5, 2.5, 100)
+h2_boundary = h1_range / 2 -.25 # Shifted -0.25 boundary for clearer visualization
+
+plt.plot(h1_range, h2_boundary, 'g--', label='Decision boundary: h2 = h1/2')
+
+plt.xlabel('h1')
+plt.ylabel('h2')
+plt.title('Hidden Layer Representation')
+plt.grid(True, alpha=0.3)
+plt.xlim(-0.5, 2.5)
+plt.ylim(-0.5, 1.5)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
