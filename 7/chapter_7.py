@@ -293,6 +293,10 @@ A * B       # Different! Multiplies corresponding elements
 [1, 2] @ [3, 4] = 1×3 + 2×4 = 11  # Returns scalar!
 ```
 
+### 4. **Inner vs Outer Products**
+**Row × Column: (1,n) @ (n,1) → scalar (dot/inner product)**  
+**Column × Row: (m,1) @ (1,n) → (m,n) matrix (outer product)**
+
 ## Solving XOR with Neural Network
 """
 
@@ -440,8 +444,11 @@ class FeedforwardNetwork:
 
   def __init__(self, input_size, hidden_size, output_size=1, activation='sigmoid', learning_rate=0.1):
     ### Initializa weights as small random vlaues
+    ### While random bias initialization works (in this example actually works much better than the zeros), the standard practice is to initialize biases to zero
+
     self.W1 = np.random.randn(hidden_size, input_size) * 0.1
     self.b1 = np.random.randn(hidden_size, 1)
+
     self.W2 = np.random.randn(output_size, hidden_size) * 0.1
     self.b2 = np.random.randn(output_size, 1)
 
@@ -607,3 +614,88 @@ print("-" * 30)
 for i in range(4):
   print(f"Input: {X_xor[i]} -> Predicted: {predictions[0,i]}, True: {y_xor[i]}")
 
+"""## PyTorch Implementation of Feedforward Networks
+
+"""
+
+class PyTorchFeedforward(nn.Module):
+  """PyTorch Implementation of Feedforward Networks"""
+
+  def __init__(self, input_size, hidden_size, output_size=1, activation='relu'):
+    super(PyTorchFeedforward, self).__init__()
+
+    # Def fully connected layers
+    self.fc1 = nn.Linear(input_size, hidden_size)
+    self.fc2 = nn.Linear(hidden_size, output_size)
+
+    # Def activation functs
+    if activation == 'relu':
+        self.activation = nn.ReLU()
+    elif activation == 'tanh':
+        self.activation = nn.Tanh()
+    elif activation == 'sigmoid':
+        self.activation = nn.Sigmoid()
+
+  def forward(self, X):
+    # Using "a1" and "a2" for the layers outputs as in the book
+    z1 = self.fc1(X)
+    a1 = self.activation(z1)
+
+    z2 = self.fc2(a1)
+    a2 = torch.sigmoid(z2)
+
+    return(a2)
+
+# Convert XOR data to PyTorch tensors
+X_xor_torch = torch.FloatTensor(X_xor)
+y_xor_torch = torch.FloatTensor(y_xor).reshape(-1, 1)
+
+# Create model
+torch_model = PyTorchFeedforward(input_size=2, hidden_size=4, activation='tanh')
+print(torch_model)
+
+## See params
+print([i for i in torch_model.parameters()])
+
+# Define Loss and Optimizer
+criterion = nn.BCELoss()
+optimizer = optim.Adam(torch_model.parameters(), lr=0.01)
+
+print(criterion)
+print(optimizer)
+
+# Training
+print("Training PyTorch XOR Network")
+torch_losses = []
+
+for epoch in range(1000):
+  # Forward pass
+  y_pred = torch_model.forward(X_xor_torch)
+  print("\ny_pred: ", y_pred, "\n")
+
+  # Loss
+  loss = criterion(y_pred, y_xor_torch)
+  print("loss: ", loss, "\n")
+  print("-"*50)
+
+  # Backward pass and optimization
+  optimizer.zero_grad()
+  loss.backward()
+  optimizer.step()
+
+  torch_losses.append(loss.item())
+
+  if epoch % 100 == 0:
+    print(f'Epoch [{epoch}/1000], Loss: {loss.item():.4f}')
+
+# Evaluate
+with torch.no_grad():
+  predictions = torch_model(X_xor_torch)
+  print("X_xor_torch: ", X_xor_torch,"\n")
+  print("predictions: ", predictions,"\n")
+
+  predicted_classes = (predictions > 0.5).float()
+  print("predicted_classes: ", predicted_classes,"\n")
+
+  accuracy = (predicted_classes == y_xor_torch).float().mean() ### tensor([[True],[True],[True],[True]]) -> 1.,1.,1.,1.
+  print(f'\nAccuracy: {accuracy:.2%}')
