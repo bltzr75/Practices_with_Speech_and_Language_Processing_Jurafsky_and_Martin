@@ -482,3 +482,115 @@ print(f"  Input shape: {sample_input.shape}")
 print(f"  Output shape: {output.shape} (ready for CrossEntropyLoss)")
 print(f"  Hidden state shape: {final_hidden.shape}")
 
+"""#LSTM for Text Classification"""
+
+class LSTMClassifier(nn.Module):
+  def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, num_layers=2, bidirectional=True, dropout=0.3):
+    super(LSTMClassifier, self).__init__()
+
+    # Embedding layer
+    self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+    # LSTM layer
+    self.lstm = nn.LSTM(
+        embedding_dim,
+        hidden_dim,
+        num_layers,
+        bidirectional=bidirectional,
+        batch_first=True,
+        dropout=dropout if num_layers > 1 else 0
+    )
+
+    # bidirectional concat if True
+    self.fc = nn.Linear (
+        hidden_dim * 2 if bidirectional else hidden_dim,
+        output_dim
+    )
+
+    self.dropout = nn.Dropout(dropout)
+    self.bidirectional = bidirectional
+    self.num_layers = num_layers
+    self.hidden_dim = hidden_dim
+
+  def forward(self, text, text_lengths=None):
+    """
+      Forward pass for sequence classification
+
+      text: input indices, shape (batch_size, max_seq_length)
+      text_lengths: actual lengths for packing (handles variable length)
+
+    """
+    batch_size = text.size(0)
+    seq_len = text.size(1)
+
+    print(f"\nForward pass: batch_size={batch_size}, max_seq_len={seq_len}")
+
+    # get embeddings
+    embedded = self.embedding(text)  # (batch, seq_len, embedding_dim)
+    print(f"After embedding: {embedded.shape}")
+
+    embedded = self.dropout(embedded)
+
+    # Pack sequences for efficiency processing of variable lengths
+    if text_lengths is not None:
+      print(f"Packing sequences with actual lengths: {text_lengths.tolist()}")
+      embedded = pack_padded_sequence(
+          embedded,
+          text_lengths.cpu(),
+          batch_first=True,
+          enforce_sorted=False
+      )
+
+    # Pass through LSTM
+    packed_output, (hidden, cell) = self.lstm(embedded)
+
+    # hidden shape: (num_layers * num_directions, batch, hidden_dim)
+    print(f"\nLSTM output hidden shape: {hidden.shape}")
+    print(f"Shape breakdown: ({self.num_layers} * {'2' if self.bidirectional else '1'}, {batch_size}, {self.hidden_dim})")
+
+    if self.bidirectional:
+      # Combine final forward and backward states
+      print("\nCombining bidirectional states:")
+      print(f"Forward (layer -2): {hidden[-2,:,:].shape}")
+      print(f"Backward (layer -1): {hidden[-1,:,:].shape}")
+      hidden = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+      print(f"Combined hidden: {hidden.shape}")
+    else:
+      # Use the last layer's hidden state
+      hidden = hidden[-1,:,:]
+      print(f"\nUsing final hidden state: {hidden.shape}")
+
+    # Apply dropout and classify
+    hidden = self.dropout(hidden)
+    output = self.fc(hidden)
+    print(f"Final output: {output.shape} (batch_size, num_classes)")
+
+    return output
+
+"""## Simple test"""
+
+print("\nTesting LSTM Classifier\n")
+print("-" * 40)
+
+vocab_size = 1000
+embedding_dim = 100
+hidden_dim = 128
+output_dim = 3  # 3 classes for classification
+batch_size = 4
+seq_length = 20
+
+model = LSTMClassifier(vocab_size, embedding_dim, hidden_dim, output_dim)
+
+# Create sample input
+sample_text = torch.randint(0, vocab_size, (batch_size, seq_length))
+sample_lengths = torch.tensor([20, 18, 15, 10])  # Variable lengths
+
+print("\nRunning test forward pass\n")
+output = model(sample_text, sample_lengths)
+
+
+print(f"\nClassification complete: {output.shape}\n")
+print("Ready for CrossEntropyLoss with target labels")
+
+print("output: \n", output)
+
