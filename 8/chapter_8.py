@@ -9,6 +9,9 @@ Original file is located at
 # Initial setup
 """
 
+# Libs for visualization of torch implementations
+!pip install torchviz torchinfo -q
+
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict, Counter
@@ -18,6 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence, pack_padded_sequence
+from torchviz import make_dot
+from torchinfo import summary
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
@@ -482,6 +487,31 @@ print(f"  Input shape: {sample_input.shape}")
 print(f"  Output shape: {output.shape} (ready for CrossEntropyLoss)")
 print(f"  Hidden state shape: {final_hidden.shape}")
 
+"""## Visualization"""
+
+# Method 1: Using torchinfo for detailed summary
+dummy_input = torch.randint(0, vocab_size, (2, 10))  # batch_size=2, seq_len=10
+print("\nModel Summary using torchinfo:")
+summary(model, input_data=dummy_input,
+        col_names=['input_size', 'output_size', 'num_params', 'trainable'],
+        depth=3, verbose=0)
+
+# Method 2: Create computation graph with torchviz
+print("\n Creating Computation Graph...")
+
+# Forward pass to create graph
+dummy_input = torch.randint(0, vocab_size, (1, 5))  # Smaller for cleaner graph
+output, hidden = model(dummy_input)
+
+# Create the graph
+graph = make_dot(output.mean(), params=dict(model.named_parameters()))
+graph.render("rnn_language_model", format="png", cleanup=True)
+print("Graph saved as 'rnn_language_model.png'")
+
+# Display the graph
+from IPython.display import Image, display
+display(Image('rnn_language_model.png'))
+
 """#LSTM for Text Classification"""
 
 class LSTMClassifier(nn.Module):
@@ -593,4 +623,38 @@ print(f"\nClassification complete: {output.shape}\n")
 print("Ready for CrossEntropyLoss with target labels")
 
 print("output: \n", output)
+
+"""# Test and visualization"""
+
+# Create classifier instance
+classifier = LSTMClassifier(
+    vocab_size=1000,
+    embedding_dim=100,
+    hidden_dim=128,
+    output_dim=2,
+    bidirectional=True
+)
+
+print("\n" + "="*60)
+print("LSTM CLASSIFIER ARCHITECTURE")
+print("="*60)
+
+# Summary
+dummy_input = torch.randint(0, 1000, (4, 20))  # batch=4, seq_len=20
+print("\n Model Summary:")
+summary(classifier, input_data=dummy_input,
+        col_names=['input_size', 'output_size', 'num_params'],
+        depth=3, verbose=0)
+
+# Create computation graph for LSTM
+print("\nCreating LSTM Computation Graph...")
+
+dummy_input = torch.randint(0, 1000, (1, 10))
+output = classifier(dummy_input)
+
+graph = make_dot(output.mean(), params=dict(classifier.named_parameters()))
+graph.render("lstm_classifier", format="png", cleanup=True)
+print("Graph saved as 'lstm_classifier.png'")
+
+display(Image('lstm_classifier.png'))
 
