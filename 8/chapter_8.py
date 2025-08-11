@@ -658,3 +658,212 @@ print("Graph saved as 'lstm_classifier.png'")
 
 display(Image('lstm_classifier.png'))
 
+"""#Encoder-Decoder Architecture
+
+"Encoder-decoder models are used when the input and output sequences can have different lengths and don't align word-to-word (e.g., translation)"
+"""
+
+class EncoderRNN(nn.Module):
+  """
+  Encoder for sequence-to-sequence models
+  The final hidden state h_n^e (^e superscript to mark the encoder) becomes the context vector c.
+  """
+
+  def __init__(self, input_size, hidden_size, num_layers=1):
+    super(EncoderRNN, self).__init__()
+
+    self.hidden_size = hidden_size
+    self.num_layers = num_layers
+
+    # Embedding for the source vocab
+    self.embedding = nn.Embedding(input_size, hidden_size)
+
+
+    # Encoder with LSTM (could be also GRU or RNN, the author recommends the BiLSTMs)
+    self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers, batch_first=True)
+
+  def forward(self, input_seq):
+    """
+    Input to seqence representation
+
+    input: Shape: (batch, sequence length)
+
+    output: All hidden states from all time steps. Shape: (batch, seq_len, hidden_dim * num_directions)
+
+    hidden: Final hidden state from all layers. Shape: (num_layers * num_directions, batch, hidden_dim)
+
+    cell: Final cell state from all layers. Shape: (num_layers * num_directions, batch, hidden_dim). It is the final "memory vector" that stores long-term information from each LSTM layer.
+    """
+
+    # Embeddings
+    embedded = self.embedding(input_seq)
+
+    # Encoding with LSTM
+    output, (hidden, cell) = self.lstm(embedded)
+
+    # hidden is shape h_n^e (^e superscript to mark the encoder) and becomes the Context C for the basic model
+    return(output, hidden, cell)
+
+class DecoderRNN(nn.Module):
+  """
+  Docoder for seq-to-seq
+  C is the context for the encoder
+  """
+
+  def __init__(self, hidden_size, output_size, num_layers=1):
+    super(DecoderRNN, self).__init__()
+
+    self.hidden_size = hidden_size
+    self.num_layers = num_layers
+
+    # Embedding
+    self.embedding = nn.Embedding(output_size, hidden_size)
+
+    # LSTM Decoder
+    self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers, batch_first=True)
+
+    # Output projection to output vocab size
+    self.out = nn.Linear(hidden_size, output_size)
+
+
+  def forward(self, input_token, hidden, cell):
+    """
+    Decode in one step.
+
+    input_token: (batch_size, 1) - previous output or <s> token
+
+    hidden, cell: hidden and cell states (context from encoder when starts)
+    """
+
+    # Embedding prev output token
+    embedded = self.embedding(input_token)
+
+
+    # Decode in one step
+    output, (hidden, cell) = self.lstm(embedded,(hidden, cell))
+
+    # Projection to vocab size
+    prediction = self.out(output)
+
+    return(prediction, hidden, cell)
+
+class Seq2Seq(nn.Module):
+  """
+  Complete encoder-decoder model
+
+  Encoder-decoder networks, sometimes called
+    sequence-to-sequence networks, are models capable of generating
+    contextually appropriate, arbitrary length output sequences.
+
+  """
+
+  def __init__(self, encoder, decoder):
+    super(Seq2Seq, self).__init__()
+
+    self.encoder = encoder
+    self.decoder = decoder
+
+  def forward(self, source, target, teacher_forcing_ratio = 0.5):
+    """
+    Forward pass with teaching forcing, using always the gold label for the next token training as input
+
+    source: source seq (batch_size, source_seq_len)
+    target: source seq (batch_size, target_seq_len)
+
+    teacher_forcing_ratio: probability of using teacher forcing
+
+    """
+
+    batch_size = source.size(0)
+    target_len = target.size(1)
+
+    target_vocab_size = self.decoder.out.out_features
+
+    # Store decoder outputs
+    outputs = torch.zeros(batch_size, target_len, target_vocab_size)
+
+    # Encode source sequence to get contxt; "c = h_n^e"  (context is final encoder hidden state) (^e superscript to mark the encoder)
+    encoder_outputs, hidden, cell = self.encoder(source)
+
+    # First decoder input is start token <s> btwn source and target
+    decoder_input = target[:, 0].unsqueeze(1)
+
+    for t in range(1, target_len):
+      # Decoding in one step
+      decoder_output, hidden, cell = self.decoder(decoder_input, hidden, cell)
+      outputs[:, t] = decoder_output.squeeze(1)
+
+      # Teacher forcing
+      use_teacher_forcing = np.random.random() < teacher_forcing_ratio
+
+      if use_teacher_forcing:
+        # Use actual nxt tkn (gold label)
+        decoder_input = target[:, t].unsqueeze(1)
+
+      else:
+        # Using the models latest prediction (autoregressive)
+        decoder_input = decoder_output.argmax(dim=2)
+
+    return(outputs)
+
+"""### Simple Test"""
+
+# Create encoder-decoder model
+input_vocab_size = 1000   # Source language vocabulary
+output_vocab_size = 1000  # Target language vocabulary
+hidden_size = 256
+
+encoder = EncoderRNN(input_vocab_size, hidden_size, num_layers=2)
+decoder = DecoderRNN(hidden_size, output_vocab_size, num_layers=2)
+seq2seq = Seq2Seq(encoder, decoder)
+
+print(seq2seq)
+
+
+print("="*60)
+print("ENCODER-DECODER MODEL TEST")
+print("="*60)
+
+# Test forward pass
+batch_size = 2
+source_len = 10
+target_len = 12
+
+source = torch.randint(0, input_vocab_size, (batch_size, source_len))
+target = torch.randint(0, output_vocab_size, (batch_size, target_len))
+
+print(f"\nInput shapes:")
+print(f"  Source: {source.shape}")
+print(f"  Target: {target.shape}")
+
+# Forward pass
+outputs = seq2seq(source, target, teacher_forcing_ratio=1.0)
+print(f"\nOutput shape: {outputs.shape}")
+print(f"  (batch={batch_size}, target_len={target_len}, vocab={output_vocab_size})")
+
+# Torchinfo summary
+print("\n" + "="*60)
+print("MODEL SUMMARY")
+print("="*60)
+print(summary(seq2seq, input_data=[source, target], depth=2, verbose=0))
+# Torchviz graph
+print("\n" + "="*60)
+print("COMPUTATION GRAPH")
+print("="*60)
+
+# Smaller input for cleaner graph
+small_source = torch.randint(0, input_vocab_size, (1, 5))
+small_target = torch.randint(0, output_vocab_size, (1, 6))
+
+outputs = seq2seq(small_source, small_target)
+graph = make_dot(outputs.mean(), params=dict(seq2seq.named_parameters()))
+graph.render("encoder_decoder", format="png", cleanup=True)
+print("Graph saved as 'encoder_decoder.png'")
+
+# Display
+display(Image('encoder_decoder.png'))
+
+# Quick parameter count
+total_params = sum(p.numel() for p in seq2seq.parameters())
+print(f"\nTotal parameters: {total_params:,}")
+
