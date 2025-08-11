@@ -82,8 +82,8 @@ class SimpleRNN:
     self.b_y = np.zeros((output_size, 1))
 
     # Storing the dimensions
-    self.input_size = input_size    # dh
-    self.hidden_size = hidden_size  # din
+    self.input_size = input_size    # din
+    self.hidden_size = hidden_size  # dh
     self.output_size =  output_size # dout
 
 
@@ -134,7 +134,8 @@ class SimpleRNN:
       x_t = X[t].reshape(-1,1) # each input at time t
       h_t, y_t = self.forward_step(x_t, h_t)
       hidden_states.append(h_t)
-      outputs = y_t
+      outputs.append(y_t)
+
 
     return(hidden_states, outputs)
 
@@ -694,12 +695,18 @@ class EncoderRNN(nn.Module):
 
     cell: Final cell state from all layers. Shape: (num_layers * num_directions, batch, hidden_dim). It is the final "memory vector" that stores long-term information from each LSTM layer.
     """
+    print("\n--- Encoder Forward Pass ---")
+    print(f"Input sequence shape: {input_seq.shape}")
 
     # Embeddings
     embedded = self.embedding(input_seq)
+    print(f"After embedding: {embedded.shape} (batch, seq_len, hidden_dim)")
 
     # Encoding with LSTM
     output, (hidden, cell) = self.lstm(embedded)
+    print(f"LSTM output shape: {output.shape} (all timesteps)")
+    print(f"Final hidden shape: {hidden.shape} (num_layers, batch, hidden_dim)")
+    print(f"Final cell shape: {cell.shape} (num_layers, batch, hidden_dim)")
 
     # hidden is shape h_n^e (^e superscript to mark the encoder) and becomes the Context C for the basic model
     return(output, hidden, cell)
@@ -734,16 +741,19 @@ class DecoderRNN(nn.Module):
 
     hidden, cell: hidden and cell states (context from encoder when starts)
     """
+    print(f"\n  Decoder step - Input token shape: {input_token.shape}")
 
     # Embedding prev output token
     embedded = self.embedding(input_token)
-
+    print(f"    After embedding: {embedded.shape}")
 
     # Decode in one step
     output, (hidden, cell) = self.lstm(embedded,(hidden, cell))
+    print(f"    LSTM output: {output.shape}")
 
     # Projection to vocab size
     prediction = self.out(output)
+    print(f"    Prediction shape: {prediction.shape} (batch, 1, vocab_size)")
 
     return(prediction, hidden, cell)
 
@@ -780,7 +790,7 @@ class Seq2Seq(nn.Module):
     target_vocab_size = self.decoder.out.out_features
 
     # Store decoder outputs
-    outputs = torch.zeros(batch_size, target_len, target_vocab_size)
+    outputs = torch.zeros(batch_size, target_len, target_vocab_size).to(source.device)
 
     # Encode source sequence to get contxt; "c = h_n^e"  (context is final encoder hidden state) (^e superscript to mark the encoder)
     encoder_outputs, hidden, cell = self.encoder(source)
@@ -806,7 +816,7 @@ class Seq2Seq(nn.Module):
 
     return(outputs)
 
-"""### Simple Test"""
+"""### Simple Test and Viz"""
 
 # Create encoder-decoder model
 input_vocab_size = 1000   # Source language vocabulary
@@ -866,4 +876,225 @@ display(Image('encoder_decoder.png'))
 # Quick parameter count
 total_params = sum(p.numel() for p in seq2seq.parameters())
 print(f"\nTotal parameters: {total_params:,}")
+
+"""#Attention Mechanism Implementation
+
+"The attention mechanism is a solution to the bottleneck problem,
+allowing the decoder to get information from all encoder hidden states,
+not just the last one."
+"""
+
+class AttentionLayer(nn.Module):
+  """
+  Dot product attention
+
+  The attention mechanism computes:
+  1. Relevance scores between decoder state cells and each encoder state cells
+  2. Normalized weights using softmax
+  3. Weighted average of encoder states as context
+  """
+
+  def __init__(self, hidden_size):
+    super(AttentionLayer, self).__init__()
+    self.hidden_size = hidden_size
+
+  def forward(self, decoder_hidden, encoder_outputs):
+    """
+    Calc attention weights and ctxt vector
+
+    1. Compute scores: "how relevant each encoder state is to
+        the decoder state captured in h_{i-1}^d"
+    2. Normalize: "α_{ij} = softmax(score(h_{i-1}^d, h_j^e))"
+    3. Context: "c_i = Σ_j α_{ij} h_j^e"
+
+    decoder_hidden: (batch_size, hidden_size) - h_{i-1}^d
+    encoder_outputs: (batch_size, seq_len, hidden_size) - all h_j^e
+    Returns: context vector and attention weights
+    """
+
+    batch_size = encoder_outputs.size(0)
+    seq_len = encoder_outputs.size(1)
+
+    # Rechape decoder hidden for batch matrix multip
+    decoder_hidden = decoder_hidden.unsqueeze(1) #shape(batch,1,hidden)
+
+    # dot prod attention scoring with torchs batch matrix-matrix product
+    scores = torch.bmm(encoder_outputs, decoder_hidden.transpose(1,2)).squeeze(2)  #  scores shape: (batch, seq_len)
+
+    # softmax to attntion weights
+    attention_weights = F.softmax(scores,dim=1)
+
+    # Calc context as weighted sum: "Compute a fixed-length context vector by taking a weighted average over all encoder hidden states"
+    attention_weights_expanded = attention_weights.unsqueeze(2)
+
+    context = torch.bmm(encoder_outputs.transpose(1,2),
+                        attention_weights_expanded).squeeze(2)
+
+
+    return(context, attention_weights)
+
+class DecoderWithAttention(nn.Module):
+  """
+  Decoder with attention mechanism
+
+  Attention replaces the static context vector with one
+      that is dynamically derived from encoder hidden states and
+      different for each token in decoding.
+
+  h_i^d = g(ŷ_{i-1}, h_{i-1}^d, c_i) where c_i is the dynamic context from attention.
+
+  """
+
+  def __init__(self, hidden_size, output_size, num_layers=1):
+    super(DecoderWithAttention, self).__init__()
+
+    self.embedding = nn.Embedding(output_size, hidden_size)
+    self.attention = AttentionLayer(hidden_size)
+
+    # LSTM input has both the embedding and the ctxt
+    self.lstm = nn.LSTM(hidden_size * 2, hidden_size, num_layers, batch_first=True)
+
+    # Output layer has both the hidden state and the ctxt
+    self.out = nn.Linear(hidden_size * 2, output_size)
+
+
+  def forward(self, input_token, hidden, cell, encoder_outputs):
+    """
+    Decode with attention to all encoder states.
+
+    input_token: (batch_size, 1)
+    hidden, cell: decoder states
+    encoder_outputs: all encoder hidden states
+
+    """
+
+    embedded = self.embedding(input_token)
+
+    # Calc attention over the encoder states "c_i = f(h_1^e...h_n^e, h_{i-1}^d)"
+    context, attention_weights = self.attention(hidden[-1], encoder_outputs)
+    context = context.unsqueeze(1) # shape (batch, 1, hddn)
+
+    # Combine embedding and attention ctxt, each gate requires both input and ctxt
+    lstm_input = torch.cat([embedded, context], dim=2)
+
+    # LSTM forward with attention in the input
+    output, (hidden, cell) = self.lstm(lstm_input, (hidden, cell))
+
+    # Combine LSTM output and context for final prediction
+    output = torch.cat([output, context], dim=2)
+
+    prediction= self.out(output)
+
+    return(prediction, hidden, cell, attention_weights)
+
+"""### Simple Test and Viz"""
+
+print("Testing Attention Mechanism:")
+print("Book: 'Attention allows the decoder to focus on")
+print("relevant parts of the source text for each output token'\n")
+
+print("="*60)
+print("ATTENTION MECHANISM TEST")
+print("="*60)
+
+# Test AttentionLayer
+print("\n1. Testing AttentionLayer:")
+hidden_size = 128
+batch_size = 4
+seq_len = 10
+
+attention = AttentionLayer(hidden_size)
+decoder_hidden = torch.randn(batch_size, hidden_size)
+encoder_outputs = torch.randn(batch_size, seq_len, hidden_size)
+
+context, weights = attention(decoder_hidden, encoder_outputs)
+print(f"  Context shape: {context.shape}")
+print(f"  Attention weights shape: {weights.shape}")
+print(f"  Weights sum per batch: {weights.sum(dim=1)}")  # Should be ~1
+
+# Test DecoderWithAttention
+print("\n2. Testing DecoderWithAttention:")
+output_vocab_size = 1000
+decoder_attn = DecoderWithAttention(hidden_size, output_vocab_size, num_layers=2)
+
+# Setup inputs
+batch_size = 2
+input_token = torch.randint(0, output_vocab_size, (batch_size, 1))
+hidden = torch.randn(2, batch_size, hidden_size)  # 2 layers
+cell = torch.randn(2, batch_size, hidden_size)
+encoder_outputs = torch.randn(batch_size, seq_len, hidden_size)
+
+print(f"  Input token: {input_token.shape}")
+print(f"  Hidden: {hidden.shape}")
+print(f"  Encoder outputs: {encoder_outputs.shape}")
+
+# Forward pass
+prediction, new_hidden, new_cell, attn_weights = decoder_attn(
+    input_token, hidden, cell, encoder_outputs
+)
+
+print(f"\n  Output prediction: {prediction.shape}")
+print(f"  New hidden: {new_hidden.shape}")
+print(f"  Attention weights: {attn_weights.shape}")
+
+# Torchinfo summary
+print("\n" + "="*60)
+print("MODEL SUMMARY")
+print("="*60)
+summary = summary(decoder_attn,
+        input_data=[input_token, hidden, cell, encoder_outputs],
+        depth=2,
+        verbose=0,
+        col_names=['input_size', 'output_size', 'num_params'])
+
+print(summary)
+
+# Torchviz graph
+print("\n" + "="*60)
+print("COMPUTATION GRAPH")
+print("="*60)
+
+# Smaller input for cleaner graph
+small_input = torch.randint(0, output_vocab_size, (1, 1))
+small_hidden = torch.randn(2, 1, hidden_size)
+small_cell = torch.randn(2, 1, hidden_size)
+small_encoder = torch.randn(1, 5, hidden_size)
+
+pred, h, c, w = decoder_attn(small_input, small_hidden, small_cell, small_encoder)
+
+# Create graph
+graph = make_dot(pred.mean(), params=dict(decoder_attn.named_parameters()))
+graph.render("decoder_attention", format="png", cleanup=True)
+print("Graph saved as 'decoder_attention.png'")
+
+# Display
+display(Image('decoder_attention.png'))
+
+# Visualize attention weights
+print("\n" + "="*60)
+print("ATTENTION WEIGHTS VISUALIZATION")
+print("="*60)
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Get attention weights from the last forward pass
+attn_viz = w[0].detach().numpy()  # First batch item
+
+plt.figure(figsize=(10, 2))
+plt.imshow(attn_viz.reshape(1, -1), cmap='Blues', aspect='auto')
+plt.colorbar(label='Attention Weight')
+plt.xlabel('Encoder Position')
+plt.ylabel('Decoder Step')
+plt.title('Attention Weights Distribution')
+plt.show()
+
+print(f"Peak attention at position: {np.argmax(attn_viz)}")
+print(f"Max attention weight: {np.max(attn_viz):.3f}")
+
+# Parameter count
+total_params = sum(p.numel() for p in decoder_attn.parameters())
+print(f"\nTotal parameters in DecoderWithAttention: {total_params:,}")
+
+""" The decoder is focusing 100% on a single encoder token (0-indexed) when generating the current output - this extreme focus (1.000) is typical for untrained models with random weights."""
 
