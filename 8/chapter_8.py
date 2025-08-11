@@ -1096,5 +1096,5 @@ print(f"Max attention weight: {np.max(attn_viz):.3f}")
 total_params = sum(p.numel() for p in decoder_attn.parameters())
 print(f"\nTotal parameters in DecoderWithAttention: {total_params:,}")
 
-""" The decoder is focusing 100% on a single encoder token (0-indexed) when generating the current output - this extreme focus (1.000) is typical for untrained models with random weights."""
+""" The decoder is focusing 100% on a single encoder token (2-indexed) when generating the current output - this extreme focus (1.000) is typical for untrained models with random weights."""
 
