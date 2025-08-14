@@ -101,7 +101,7 @@ def simplified_attention(X):
       else:
         scores[i,j] = -np.inf
 
-  print(f"\nScores shape: {scores.shape}")
+  print(f"\nScores shape:\n {scores.shape}")
   print(f"Scores:\n {np.round(scores,4)}\n")
 
   # Apply softmax for attention weights
@@ -109,9 +109,9 @@ def simplified_attention(X):
 
   for i in range(N):
     exp_scores = np.exp(scores[i] - np.max(scores[i]))    #NUMERICAL STABILITY TRICK: Subtract max before exponentiating
-    print("\nexp_scores: ", exp_scores)
+    print("\nexp_scores: \n", exp_scores)
     attention_weights[i] = exp_scores / np.sum(exp_scores) # Normalize to get probs
-    print(f"attention_weights[{i}]:\n ", attention_weights[i],"\n")
+    print(f"\nattention_weights[{i}]:\n ", attention_weights[i],"\n")
 
 
   print(f"attention_weights:\n ", np.round(attention_weights,3),"\n")
@@ -125,9 +125,11 @@ def simplified_attention(X):
   output = np.zeros_like(X) # shape (N,d)
   for i in range(N):
     for j in range(i+1): # Only sum over positions we can attend to (causal)
-      output[i] += attention_weights[i,j] * X[j] # Each output token is a weighted combination of input tokens
-      print(f"output[{i}]: Embedding {output[i]} +=  Attention weight({attention_weights[i,j]}) * Input ({X[j]}) \n")
+      print(f"Current  output[{i}]: Embedding {output[i]} +=  Attention weight({attention_weights[i,j]}) * Input of X[{j}] ({X[j]})")
 
+      output[i] += attention_weights[i,j] * X[j] # Each output token is a weighted combination of input tokens
+
+      print(f"Updated  output[{i}]: Embedding {output[i]} \n")
 
   print(f"Output:\n {output}")
 
@@ -142,3 +144,403 @@ output, weights = simplified_attention(X)
 
 # Viz
 visualize_attention(weights[:, :len(tokens)], tokens, "Simplified Attention")
+
+"""# Attention with Q, K, V Matrices using NumPy"""
+
+class AttentionNumpy:
+  """
+  Single attention head with Query, Key, Value matrices
+
+  d_model: Dimension of input/output embeddings (model's hidden size)
+  d_k: Dimension of queries and keys (typically d_model / num_heads)
+  d_v: Dimension of values (often same as d_k)
+  """
+
+  def __init__(self, d_model, d_k, d_v):
+    self.d_model = d_model
+    self.d_k = d_k
+    self.d_v = d_v
+
+    # Initialize weight matrices
+    self.W_Q = np.random.randn(d_model, d_k) * 0.1 # Query Projection
+    self.W_K = np.random.randn(d_model, d_k) * 0.1 # Key Projection
+    self.W_V = np.random.randn(d_model, d_v) * 0.1 # Value Projection
+
+    self.W_O = np.random.randn(d_v, d_model) * 0.1  # Output projection: Projects concatenated/summed attention outputs back to model dimension
+
+    print(f"Initialized weights: W_Q{self.W_Q.shape}, W_K{self.W_K.shape}, W_V{self.W_V.shape}, W_O{self.W_O.shape}")
+
+
+  def forward(self, X):
+    """
+    X: [N, d_model] input sequence
+    Returns: [N, d_model] attention output
+    """
+
+    N = X.shape[0] # Num of tokens/positions of the sequence
+
+    Q = X @ self.W_Q # shpae [N, d_k]
+    K = X @ self.W_K # shpae [N, d_k]
+    V = X @ self.W_V # shpae [N, d_v]
+
+    print(f"Q: {Q.shape}, K: {K.shape}, V: {V.shape}")
+
+
+    # Scaled dot prod attention
+    scores = (Q @ K.T) / np.sqrt(self.d_k) # [N, N]
+
+    # Causal mask
+    mask = np.triu(np.ones((N,N)) * -np.inf, k=1)
+    scores = scores + mask
+
+    # Softmax
+    exp_scores = np.exp(scores - np.max(scores, axis=-1, keepdims=True)) # np.triu: Upper triangular matrix (k=1 means above main diagonal)
+    attention_weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True) #  axis=-1: Apply along last dimension (rows) ;  keepdims=True: Maintains shape for broadcasting
+
+    print(f"\nexp_scores shape: {exp_scores.shape}\n")
+    print(f"\nexp_scores:\n {exp_scores.round(3)}\n")
+
+    print(f"\nAttention weights shape: {attention_weights.shape}\n")
+    print(f"\nAttention weights:\n {attention_weights.round(3)}\n")
+
+
+    # Weighted sum of values
+    head_output = attention_weights @ V # [N, d_v]
+
+    # Output projection
+    output = head_output @ self.W_O # [N, d_model]
+
+    return output, attention_weights
+
+"""#### Simple test"""
+
+d_model, d_k, d_v = 8,4,4
+attention = AttentionNumpy(d_model, d_k, d_v)
+
+X = np.random.randn(len(tokens), d_model)
+output, weights = attention.forward(X)
+
+print(f"\nFinal output shape: {output.shape}")
+visualize_attention(weights, tokens, "Attention with Q,K,V")
+
+"""## Explanation of how nn.Linear handles batched inputs
+
+Here's a brief explanation of how `nn.Linear` handles batched inputs:
+
+```python
+self.W_Q = nn.Linear(d_model, d_head, bias=False)
+# Creates a weight matrix of shape [d_model, d_head]
+# This is just a matrix, like W_Q = [[w11, w12, ...], [w21, w22, ...], ...]
+
+Q = self.W_Q(x)  # x shape: [batch, seq_len, d_model]
+                 # Q shape: [batch, seq_len, d_head]
+```
+
+**What's happening under the hood:**
+
+`nn.Linear` is smart about dimensions. It applies matrix multiplication to the **last dimension** while preserving all previous dimensions:
+
+```python
+# What nn.Linear does internally (simplified):
+# For input x with shape [batch, seq_len, d_model]
+# It treats this as [*, d_model] where * = any number of preceding dimensions
+# Then does: x @ W_Q.T for the last dimension
+
+# Effectively, for each batch and each position:
+# Q[batch_i][seq_j] = x[batch_i][seq_j] @ W_Q.T
+# where @ is matrix multiply
+```
+
+**THE ONLY REQUIREMENT:**
+- Input's **last dimension** must equal the Linear layer's **in_features**
+- Everything else (batch size, sequence length, extra dimensions) can be anything
+
+**Examples:**
+```python
+layer = nn.Linear(64, 32)  # Expects last dim = 64, outputs last dim = 32
+
+# ✅ These all work:
+layer(torch.randn(10, 64))        # [10, 64] → [10, 32]
+layer(torch.randn(5, 20, 64))     # [5, 20, 64] → [5, 20, 32]
+layer(torch.randn(2, 8, 12, 64))  # [2, 8, 12, 64] → [2, 8, 12, 32]
+
+# ❌ These fail:
+layer(torch.randn(10, 32))        # Error! Last dim 32 ≠ 64
+layer(torch.randn(5, 20, 128))    # Error! Last dim 128 ≠ 64
+```
+
+
+
+**Visual example:**
+```
+If x = [2, 8, 64]  (2 batches, 8 positions, 64-dim embeddings)
+   W_Q = [64, 16]   (transforms 64-dim → 16-dim)
+   
+nn.Linear applies the SAME weight matrix to:
+- Batch 0, Position 0: [64] → [16]
+- Batch 0, Position 1: [64] → [16]
+- ...
+- Batch 1, Position 7: [64] → [16]
+
+Result Q = [2, 8, 16]  (same batch & seq_len, new dimension)
+```
+
+**The key insight:** `nn.Linear` automatically broadcasts its operation across all dimensions except the last one, so you don't need to write loops over batches or sequences. One weight matrix, applied everywhere!
+
+
+
+
+**In summary:** Only the **last dimension** needs to match the layer's `in_features`. All other dimensions pass through unchanged.
+
+# Single Attention Head using PyTorch
+"""
+
+class AttentionHead(nn.Module):
+  """
+  PyTorch implementation of a single attention head
+
+  d_model is the dimension of input/output embeddings (model's hidden size)
+  d_head  is the compressed/projected dimension for computational efficiency and multi-head splitting, usually the embedding // num of attention heads
+
+  """
+
+  def __init__(self, d_model, d_head):
+    super(AttentionHead,self).__init__()  #Initialize parent nn.Module class, this registers parameters and enables .to(device), .train(), etc.
+
+    self.d_head  = d_head # Dimension of this attention head, although total model may have multiple heads (multi-head attention)
+
+    # Linear projections for Q, K, V
+    self.W_Q = nn.Linear(d_model, d_head, bias = False)
+    self.W_K = nn.Linear(d_model, d_head, bias = False)
+    self.W_V = nn.Linear(d_model, d_head, bias = False)
+    self.W_O = nn.Linear(d_head, d_model, bias = False) # shape (hidden, output)
+
+    self.scale = 1.0 / math.sqrt(d_head) # Pre-compute scaling factor for efficiency to prevent softmax saturation
+
+  def forward(self, x, mask=None):
+    """
+    x: [batch, seq_len, d_model] ## PyTorch convention: batch dimension first for efficiency. This allows processing multiple sequences in parallel on GPU
+    Returns: [batch, seq_len, d_model], attention_weights
+    """
+
+    batch_size, seq_len, d_model = x.shape
+
+
+    # comput Q, K, V
+    Q = self.W_Q(x)  # [batch, seq_len, d_head]  PyTorch's nn.Linear automatically handles batch dimension. It applies the same transformation to each batch element
+    K = self.W_K(x)  # nn.Linear is smart about dimensions. It applies matrix multiplication to the last dimension while preserving all previous dimensions
+    V = self.W_V(x)
+
+    # Scaled dot prod attention
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale # [batch, seq_len, seq_len].   K.transpose(-2, -1): Swaps last two dimensions (seq_len, d_head) → (d_head, seq_len). Negative indexing: -1 = last dim, -2 = second-to-last
+
+    # Mask if provided
+    if mask is not None:
+      scores = scores.masked_fill(mask == 0, -1e9)
+
+    attn_weights = F.softmax(scores, dim = -1)  # dim=-1: Apply softmax along last dimension (over keys for each query)
+
+    # Apply attention to values
+    context = torch.matmul(attn_weights, V)  # [batch, seq_len, d_head]
+
+    # Output
+    output = self.W_O(context) # [batch, seq_len, d_model]  Project head dim back to model dim. Enables residual connections in full Transformer
+
+    return(output, attn_weights)
+
+"""### Test Multi-Head Attention"""
+
+# Test PyTorch attention head
+d_model, d_head = 64, 16
+attention_head = AttentionHead(d_model, d_head)
+
+# Create sample input
+batch_size, seq_len = 2, 8
+x = torch.randn(batch_size, seq_len, d_model)
+
+# Create causal mask
+mask = torch.tril(torch.ones(seq_len, seq_len)).unsqueeze(0)
+print(f"Input shape: {x.shape}")
+print(f"Mask shape: {mask.shape}")
+
+output, attn_weights = attention_head(x, mask)
+print(f"Output shape: {output.shape}")
+print(f"Attention weights shape: {attn_weights.shape}")
+
+# Visualize attention for first batch
+visualize_attention(attn_weights[0].detach().numpy(), title="PyTorch Attention Head")
+
+# Model summary
+summary(attention_head, input_data=[x, mask], verbose=0)
+
+"""#Multi-Head Attention with NumPy
+
+"""
+
+class MultiHeadAttentionNumPy:
+  """Multi-Head attention mechanism"""
+
+  def __init__(self, d_model, n_heads, d_k, d_v):
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.d_k = d_k
+    self.d_v = d_k
+
+    self.W_Q = [np.random.randn(d_model, d_k) * 0.1 for _ in range(n_heads)  ]
+    self.W_K = [np.random.randn(d_model, d_k) * 0.1 for _ in range(n_heads)  ]
+    self.W_V = [np.random.randn(d_model, d_v) * 0.1 for _ in range(n_heads)  ]
+    self.W_O = np.random.randn(n_heads * d_v, d_model) * 0.1
+
+    print(f"Multi-head attention: {n_heads} heads, d_k={d_k}, d_v={d_v}")
+
+  def forward(self, X):
+    """
+    X: [N, d_model]
+    Returns: [N, d_model], list of attention weights per head
+    """
+
+
+    N = X.shape[0]
+    head_outputs = []
+    attention_weights_all = []
+
+    # Processing each head
+    for h in range(self.n_heads):
+      # Compute Q, K, V per head
+      Q_h = X @ self.W_Q[h]
+      K_h = X @ self.W_K[h]
+      V_h = X @ self.W_V[h]
+
+      # scaled dot prod attntion
+      scores = (Q_h @ K_h.T) / (np.sqrt(self.d_k))
+
+      # causal mask
+      mask = np.triu(np.ones((N,N)) * -np.inf,k=1 )
+      scores = scores + mask
+
+      # softmax with optimization and normalization
+      exp_scores = np.exp(scores - np.max(scores, axis=-1, keepdims=True))  # Numerical stability trick: subtract max before exp
+      attn_weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True) # Normalize to get probabilities [N, N]
+      attention_weights_all.append(attn_weights)
+
+      # Weighted sum
+      head_out = attn_weights @ V_h  # [N, N] × [N, d_v] = [N, d_v] - Weighted combination of values
+      head_outputs.append(head_out)
+
+    # Concat heads
+    concat_heads = np.concatenate(head_outputs, axis=1) # [N, d_v] × n_heads → [N, n_heads * d_v]
+    print(f"Concatenated heads shape: {concat_heads.shape}")
+
+    # Output projection
+    output = concat_heads @ self.W_O  # [N, n_heads*d_v] × [n_heads*d_v, d_model] = [N, d_model] - Final output
+
+    return(output, attention_weights_all)
+
+"""### Test multi-head attention
+
+"""
+
+d_model, n_heads = 64, 4  # 64-dim embeddings, 4 parallel attention heads
+d_k = d_v = d_model // n_heads  # 16 dims per head (64/4)
+mha = MultiHeadAttentionNumPy(d_model, n_heads, d_k, d_v)
+X = np.random.randn(8, d_model)  # Input: 8 tokens, each 64-dimensional
+output, attn_weights_list = mha.forward(X)
+print(f"Output shape: {output.shape}")  # Should be [8, 64]
+print(f"Number of attention matrices: {len(attn_weights_list)}")  # Should be 4 (one per head)
+
+# Visualize attention from different heads
+fig, axes = plt.subplots(1, n_heads, figsize=(15, 3))
+for i, (ax, attn) in enumerate(zip(axes, attn_weights_list)):
+    sns.heatmap(attn, ax=ax, cmap='Blues', cbar=False, square=True)  # Each head learns different attention patterns
+    ax.set_title(f"Head {i+1}")
+plt.suptitle("Attention Patterns Across Heads")  # Different heads capture different relationships
+plt.tight_layout()
+plt.show()
+
+"""#Multi-Head Attention with PyTorch"""
+
+class MultiHeadAttention(nn.Module):
+  def __init__(self, d_model, n_heads, dropout=0.1):
+    super().__init__()
+
+    assert d_model % n_heads == 0 # Ensure d_model is divisible by n_heads for even split
+
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.d_k = d_model // n_heads
+
+    # Single projection for all heads (more efficient)
+    self.W_Q = nn.Linear(d_model, d_model, bias=False)
+    self.W_K = nn.Linear(d_model, d_model, bias=False)
+    self.W_V = nn.Linear(d_model, d_model, bias=False)
+    self.W_O = nn.Linear(d_model, d_model, bias=False)
+
+    self.dropout = nn.Dropout(dropout) # Regularization
+    self.scale = 1.0 / math.sqrt(self.d_k)
+
+  def forward(self, x, mask=None):
+    """
+    x: [batch, seq_len, d_model]  # Batched input for parallel processing
+    Returns: [batch, seq_len, d_model]
+    """
+
+    batch_size, seq_len, d_model = x.shape
+
+    # Linear projections in batch from d_model => n_heads * d_k
+    Q = self.W_Q(x).view(batch_size, seq_len, self.n_heads, self.d_k)  # [B, L, d] → [B, L, h, d_k] - Reshape to separate heads. view() is O(1) - just changes stride info. Each head gets d_k dimensions
+    K = self.W_K(x).view(batch_size, seq_len, self.n_heads, self.d_k)
+    V = self.W_V(x).view(batch_size, seq_len, self.n_heads, self.d_k)
+
+    # Transpose for attention: [batch, n_heads, seq_len, d_k].  [B, L, h, d_k] -> [B, h, L, d_k]
+    Q = Q.transpose(1,2) # moves position 1 to position 2
+    K = K.transpose(1,2)
+    V = V.transpose(1,2)
+
+    print(f"Q shape after transpose: {Q.shape}")
+
+
+    # Scaled dot-product attention
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [B, h, L, d_k] × [B, h, d_k, L] = [B, h, L, L]
+    print(f"Attention scores shape: {scores.shape}")  # Each position attends to all positions
+
+
+    # Apply mask
+    if mask is not None:
+       mask = mask.unsqueeze(0).unsqueeze(1) # [L,L] -> [1,L,L] broadcasting for heads dimension
+       scores = scores.masked_fill(mask == 0, -1e9)
+
+    # Softmax
+    attn_weights = F.softmax(scores,dim=-1)
+    attn_weights = self.dropout(attn_weights) # Dropout
+
+    # Apply attention to values
+    context = torch.matmul(attn_weights, V)  # [B, h, L, L] × [B, h, L, d_k] = [B, h, L, d_k] - Weighted sum of values
+
+    # Cncat heads
+    context = context.transpose(1, 2).contiguous().view(  # transpose back: [B, L, h, d_k]
+        batch_size, seq_len, d_model  # view: [B, L, h*d_k] = [B, L, d_model] - Merge all heads
+    )  # contiguous() ensures memory layout is sequential after transpose (required for view)
+    print(f"Context after concatenation: {context.shape}")
+
+    # final linear projection
+    output = self.W_O(context)  # [B, L, d_model] → [B, L, d_model] - Mix information from all heads
+
+    return(output, attn_weights)
+
+"""### Test PyTorch Multi-head attention
+
+"""
+
+mha_torch = MultiHeadAttention(d_model=128, n_heads=8)  # 8 heads × 16 dims = 128 total
+x = torch.randn(2, 10, 128)  # [batch=2, seq=10, d_model=128] - 2 sequences, 10 tokens each
+mask = torch.tril(torch.ones(10, 10))  # Lower triangular causal mask (can't attend to future)
+output, attn_weights = mha_torch(x, mask)
+print(f"\nFinal output shape: {output.shape}")  # Should be [2, 10, 128]
+print(f"Attention weights shape: {attn_weights.shape}")  # [2, 8, 10, 10] - attention map per head per batch
+
+# Create computation graph
+y = output.mean()  # Scalar output needed for autograd graph
+graph = make_dot(y, params=dict(mha_torch.named_parameters()))  # Visualize backward pass connections
+graph.render("Multi_head_attention", format="png", cleanup=True)
+print("Computation graph saved as 'Multi_head_attention.png'")
+
