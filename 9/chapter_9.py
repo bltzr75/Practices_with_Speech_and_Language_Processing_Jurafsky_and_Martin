@@ -923,3 +923,216 @@ def estimate_memory_usage(model):
 
 estimate_memory_usage(transformer)  # Each layer adds ~400K params (4 matrices in MHA + 2 in FFN + 2 LayerNorms)
 
+"""# Parallelization: Batch Matrix Multiplication for Attention
+Attention parallelization is only during forward pass (not training/backprop).
+"""
+
+def parallel_attention_computation(Q,K,V,mask=None):
+  """
+  Efficient parallel attention computation
+  Q,K,V: [batch, n_heads, seq_len, d_k]
+  """
+
+  batch_size, n_heads, seq_len, d_k = Q.shape
+
+  # Parallel QK^T computation for all heads and batches
+  # [batch, n_heads, seq_len, d_k] @ [batch, n_heads, d_k, seq_len]
+  scores = torch.matmul(Q, K.transpose(-2,-1))/math.sqrt(d_k) # Normalization
+  print(f"Parallel scores computation: {Q.shape} @ {K.transpose(-2, -1).shape} = {scores.shape}")
+
+  # Mask if provided
+  if mask is not None:
+    scores = scores.masked_fill(mask==0, -1e9) # that small value masked will be turned 0 by the next sftmax
+
+  # Parallel softmax
+  attn_weights = F.softmax(scores, dim=-1)
+
+  # Parallel weighted sum
+  # [batch, n_heads, seq_len, seq_len] @ [batch, n_heads, seq_len, d_v]
+  output = torch.matmul(attn_weights, V)
+  print(f"Parallel output: {attn_weights.shape} @ {V.shape} = {output.shape}\n")
+
+  return(output, attn_weights)
+
+"""## Benchmark parallel vs sequential
+
+"""
+
+def benchmark_attention():
+  """Compare parallel vs sequential attn computation"""
+  batch_size, n_heads, seq_len, d_k = 32, 8, 128, 64
+
+  Q = torch.randn(batch_size, n_heads, seq_len, d_k)
+  K = torch.randn(batch_size, n_heads, seq_len, d_k)
+  V = torch.randn(batch_size, n_heads, seq_len, d_k)
+
+  # Parallel computation
+  start = time.time()
+  for _ in range(100):
+    out_parallel, _ = parallel_attention_computation(Q,K,V)
+  parallel_time = time.time()-start
+
+  # Sequential computation
+  start = time.time()
+  for _ in range(100):
+    outputs = []
+    for h in range(n_heads):
+      scores = torch.matmul(Q[:,h], K[:,h].transpose(-2,-1)) / math.sqrt(d_k)
+      attn = F.softmax(scores, dim=-1) # dim is the dimension along to compute the softmax
+      out = torch.matmul(attn, V[:,h])
+      outputs.append(out)
+
+    out_sequential = torch.stack(outputs, dim=1)
+
+  sequential_time = time.time()-start
+
+  print(f"Parallel time: {parallel_time:.3f}s")
+  print(f"Sequential time: {sequential_time:.3f}s")
+  print(f"Speedup: {sequential_time/parallel_time:.2f}x")
+
+  # Verify outputs are the same
+  assert torch.allclose(out_parallel, out_sequential, atol=1e-5)
+  print("Outputs match!")
+
+benchmark_attention()
+
+"""# Parallelization: Optimized Multi-Head Attention"""
+
+class OptimizedMultiHeadAttention(nn.Module):
+  """Memory-efficient multi-head attention with single matrix operations"""
+
+  def __init__(self, d_model, n_heads, dropout=0.1):
+    super().__init__()
+
+    assert d_model % n_heads == 0
+
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.d_k = d_model//n_heads
+
+    # Single large matrix for all Q,K,V projections
+    self.qkv_proj = nn.Linear(d_model, 3*d_model, bias=False)  # Fused QKV: d_model → 3*d_model in one matmul
+    self.out_proj = nn.Linear(d_model, d_model, bias=False)  # Final projection after concatenating heads. Is the  W^O (output weights) matrix
+
+    self.dropout = nn.Dropout(dropout)
+    self.scale = 1.0/math.sqrt(self.d_k)
+
+  def forward(self, x, mask=None):
+    batch_size, seq_len, d_model = x.shape
+
+    # Single matrix multiply for Q,K,V
+    qkv = self.qkv_proj(x) # [batch, seq, 3*d_model] - One big matmul instead of 3 separate ones
+    print(f"\n\n1. After QKV projection: {qkv.shape}")
+    print(f"   Input {x.shape} → Output {qkv.shape}")
+    print(f"   Weight matrix shape: [{self.d_model}, {3*self.d_model}]")
+
+    qkv = qkv.reshape(batch_size, seq_len, 3, self.n_heads, self.d_k) # Split into Q,K,V and heads
+    print(f"\n\n2. After reshape: {qkv.shape}")
+    print(f"   Split into: 3 matrices (Q,K,V) × {self.n_heads} heads × {self.d_k} dims/head")
+
+
+
+    qkv = qkv.permute(2,0,3,1,4) # [3, batch, n_heads, seq, d_k] - Rearrange for parallel head computation
+    print(f"\n\n3. After permute: {qkv.shape}")
+    print(f"   Reordered dims: [QKV, batch, heads, seq, d_k]")
+    print(f"   First dim (3) = [Q tensor, K tensor, V tensor]")
+
+    Q,K,V = qkv[0], qkv[1], qkv[2]# Extract Q, K, V tensors
+    print(f"\n\n4. Individual Q,K,V shapes: {Q.shape}")
+    print(f"   Q: {Q.shape} = [batch={batch_size}, heads={self.n_heads}, seq={seq_len}, d_k={self.d_k}]")
+    print(f"   K: {K.shape} (same as Q)")
+    print(f"   V: {V.shape} (same as Q)")
+    print(f"   Total parameters in QKV: {3 * self.d_model * self.d_model:,}")
+
+
+    print(f"\nEfficient QKV computation: {x.shape} → {qkv.shape} → 3×{Q.shape}")
+
+
+    # Scaled dot prod attention in parallel
+    scores = torch.matmul(Q,K.transpose(-2,-1)) * self.scale # [batch, n_heads, seq, seq] - Attention scores
+
+    if mask is not None:
+      mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq] - broadcast across batch and heads
+      scores = scores.masked_fill(mask==0, -1e9) # Set masked positions to -inf before softmax
+
+    attn_weights = F.softmax(scores, dim=-1)
+    attn_weights = self.dropout(attn_weights)
+
+    # Applying Attention
+    context = torch.matmul(attn_weights, V)  # [batch, n_heads, seq, d_k] - Weighted sum of values
+
+    # Reshape and Projection
+    context = context.transpose(1,2).contiguous() # [batch, seq, n_heads, d_k] - Prepare for concatenation
+    context = context.view(batch_size, seq_len, d_model) # Concatenate heads: [batch, seq, n_heads*d_k]
+    output = self.out_proj(context) # Final linear projection
+
+    return(output, attn_weights)
+
+"""### Compare memory usage
+
+"""
+
+def compare_attention_implementations():
+  """Compare memory usage of different implementations"""
+  d_model, n_heads = 512, 8
+  seq_len, batch_size = 128, 16
+
+  # Standard implementation
+  standard_mha = MultiHeadAttention(d_model, n_heads)
+
+  # Optimized implementation
+  optimized_mha = OptimizedMultiHeadAttention(d_model, n_heads)
+
+  # Count parameters
+  standard_params = sum(p.numel() for p in standard_mha.parameters())
+  optimized_params = sum(p.numel() for p in optimized_mha.parameters())
+
+  print(f"Standard MHA parameters: {standard_params:,}")
+  print(f"Optimized MHA parameters: {optimized_params:,}")
+  print(f"Memory saved: {(standard_params - optimized_params):,} parameters")
+
+  # Test forward pass
+  x = torch.randn(batch_size, seq_len, d_model)
+  mask = torch.tril(torch.ones(seq_len, seq_len))
+
+  # Time comparison
+  import time
+
+  # Standard
+  start = time.time()
+  for _ in range(100):
+    _, _ = standard_mha(x, mask)
+  standard_time = time.time() - start
+
+  # Optimized
+  start = time.time()
+  for _ in range(100):
+    _, _ = optimized_mha(x, mask)
+  optimized_time = time.time() - start
+
+  print(f"\nStandard time: {standard_time:.3f}s")
+  print(f"Optimized time: {optimized_time:.3f}s")
+  print(f"Speedup: {standard_time/optimized_time:.2f}x")
+
+compare_attention_implementations()
+
+"""Probably got slower because of the Additional Reshape/Permute Operations, or bcs of the Memory Access Patterns (the fused QKV might have worse cache locality), or bcs of the print statements that I added.
+
+
+Althought it got slower the "optimized" version's advantages are:
+
+
+
+*   Memory efficiency: Uses 1 weight matrix instead of 3 (though same total parameters)
+
+*   Single matrix multiplication: Better for GPU kernel fusion in production
+
+
+
+*   Scales better: With very large models/batches, the fused approach wins
+
+
+
+
+
+"""
