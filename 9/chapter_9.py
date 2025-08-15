@@ -544,3 +544,145 @@ graph = make_dot(y, params=dict(mha_torch.named_parameters()))  # Visualize back
 graph.render("Multi_head_attention", format="png", cleanup=True)
 print("Computation graph saved as 'Multi_head_attention.png'")
 
+"""#Feedforward Network"""
+
+class FeedForward(nn.Module):
+  """
+  FFN(x) = ReLU(xW1 + b1)W2 + b2
+  Usually d_ff = 4 * d_model
+  """
+
+  def __init__(self, d_model, d_ff=None, dropout=0.1, activation='relu'):
+    super().__init__()
+
+    d_ff = 4*d_model # Default: expand by 4x (e.g., 512 → 2048)
+
+    self.linear1 = nn.Linear(d_model, d_ff)
+    self.linear2 = nn.Linear(d_ff, d_model)
+
+    self.dropout = nn.Dropout(dropout)
+
+    self.activation = nn.ReLU() if activation =='relu' else nn.GELU() # GELU: smoother, differentiable everywhere
+    self.activation_name = activation
+
+    print(f"FFN: {d_model} → {d_ff} → {d_model} with {activation}")
+
+
+  def forward(self,x):
+    """
+    x: [batch, seq_len, d_model]
+    Returns: [batch, seq_len, d_model]
+    """
+
+    # First layer: linear + activation + regularization
+    x = self.linear1(x) # [B, L, d_model] → [B, L, d_ff] - Project to higher dimension
+    x = self.activation(x)
+    x = self.dropout(x)
+
+    # Second layer
+    x = self.linear2(x) # [B, L, d_ff] → [B, L, d_model] - Project back to original dimension
+
+    print(f"After linear2: {x.shape}")
+
+    return(x)
+
+"""### Simple test comparing ReLU vs GELU"""
+
+d_model = 128
+
+ffn_relu = FeedForward(d_model, activation='relu')
+ffn_gelu = FeedForward(d_model, activation='gelu')
+
+x = torch.randn(2,10, d_model)   # [batch=2, seq=10, features=128]
+
+out_relu = ffn_relu(x)
+out_gelu = ffn_gelu(x)
+
+# Visualization
+x_test = torch.linspace(-3,3, 100)
+relu_out = F.relu(x_test)
+gelu_out = F.gelu(x_test)
+
+plt.figure(figsize=(10,4))
+
+plt.subplot(1,2,1)
+plt.plot(x_test, relu_out, label='ReLU', linewidth=2)
+plt.plot(x_test, gelu_out, label='GELU', linewidth=2)
+plt.xlabel('Input')
+plt.ylabel('Output')
+plt.title('Activation Functions')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1,2,2) # Derivatives
+relu_grad = (x_test > 0).float()  # ReLU gradient: 0 if x<0, 1 if x>0 (undefined at 0)
+x_test.requires_grad = True  # Enable gradient computation for GELU
+gelu_out = F.gelu(x_test)
+gelu_grad = torch.autograd.grad(gelu_out.sum(), x_test, create_graph=True)[0]  # Compute GELU gradient via autograd
+
+plt.plot(x_test.detach(), relu_grad, label='ReLU gradient', linewidth=2)  # Step function
+plt.plot(x_test.detach(), gelu_grad.detach(), label='GELU gradient', linewidth=2)  # Smooth S-curve
+plt.xlabel('Input')
+plt.ylabel('Gradient')
+plt.title('Gradients')  # GELU has non-zero gradients for negative inputs (helps with dead neurons)
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+
+
+plt.tight_layout()
+plt.show()
+
+"""#Layer Normalization with Numpy"""
+
+class LayerNormNumPy:
+  def __init__(self, d_model, eps=1e-5):
+    self.d_model = d_model # Channels
+    self.eps = eps # Small constant for numerical stability
+
+    # Learnable params
+    self.gamma = np.ones(d_model)
+    self.beta  = np.zeros(d_model)
+
+  def forward(self, x):
+    """ Normalize over last dimetnsion"""
+
+    # Compute mean and std
+    mean = np.mean(x, axis=-1, keepdims=True) # axis=-1 apply along last dim (rows), keepdims mantain dimensionality for broadcasting
+    var = np.var(x, axis=-1, keepdims=True)
+    std = np.sqrt(var + self.eps) # epsilon brings num stability
+
+    print(f"Mean shape: {mean.shape}, first 3 values: {mean.flat[:3].round(3)}\n")
+    print(f"Std shape: {std.shape}, first 3 values: {std.flat[:3].round(3)}\n")
+
+
+    # Normalize
+    x_norm = (x-mean)/std
+
+    # Scale and shift
+    output = self.gamma * x_norm + self.beta
+
+    print("output = self.gamma * x_norm + self.beta \n")
+    print(f"output {output} =\n gamma {self.gamma} * \n x_norm{x_norm.ravel()} \n+ beta {self.beta} ")
+
+
+    return(output)
+
+d_model = 8
+x = np.random.randn(2, 4, d_model) * 5 + 2  # Non-normalized input
+
+# Numpy implementation
+ln_numpy = LayerNormNumPy(d_model)
+out_numpy = ln_numpy.forward(x)
+
+# Same but with pyTorch
+ln_torch = nn.LayerNorm(d_model)
+x_torch = torch.tensor(x, dtype=torch.float32)
+out_torch = ln_torch(x_torch)
+
+print(f"\nInput stats - Mean: {x.mean():.3f}, Std: {x.std():.3f}")
+print(f"Numpy output stats - Mean: {out_numpy.mean():.3f}, Std: {out_numpy.std():.16f}")
+print(f"PyTorch output stats - Mean: {out_torch.mean():.3f}, Std: {out_torch.std():.16f}")
+
+print(f"{'PyTorch' if (abs(1-out_torch.std().item()) < abs(1-out_numpy.std())) else 'NumPy'} std closest to 1.0")
+
