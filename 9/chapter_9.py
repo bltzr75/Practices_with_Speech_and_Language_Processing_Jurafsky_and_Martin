@@ -1136,3 +1136,254 @@ Althought it got slower the "optimized" version's advantages are:
 
 
 """
+
+compare_attention_implementations
+
+"""#Input Encoding: Token Embeddings"""
+
+class TokenEmbedding(nn.Module):
+  """Token embedding layer with various initialization strategies"""
+
+  def __init__(self, vocab_size, d_model, init_strategy='normal'):
+    super(TokenEmbedding, self).__init__()
+
+    self.embedding = nn.Embedding(vocab_size, d_model)
+
+    # Diff initialization strategies
+    if init_strategy == 'normal':
+      nn.init.normal_(self.embedding.weight, mean=0, std=0.02) # GPT-style init
+    elif init_strategy == 'uniform':
+      nn.init.uniform_(self.embedding.weight, -0.1, 0.1) # Random between bounds
+    elif init_strategy == 'xavier':
+      nn.init.xavier_uniform_ #The method is described in Understanding the difficulty of training deep feedforward neural networks - Glorot, X. & Bengio, Y. (2010).  Xavier initialization (also called Glorot initialization) sets initial weights by sampling from a distribution with variance designed to keep activations and gradients roughly the same scale across layers. This prevents vanishing/exploding gradients by ensuring that as signals propagate through the network, they neither shrink to zero nor blow up exponentially, maintaining stable training dynamics especially in deep networks with sigmoid or tanh activations.
+
+    self.d_model = d_model # Embedding dim
+    self.vocab_size = vocab_size
+
+  def forward(self,x):
+    """
+    x: [batch, seq_len] token indices
+    Returns: [batch, seq_len, d_model]
+    """
+
+    return self.embedding(x) * math.sqrt(self.d_model) # Scaling by sqrt(d_model) - helps with gradient flow
+
+"""### Demonstrate one-hot encoding vs embedding lookup
+
+"""
+
+def demonstrate_embedding_lookup():
+  """Show equivalence of one-hot multiplication and embedding lookup"""
+  vocab_size, d_model = 100, 16  # Small vocab for visualization
+
+  # Create embedding matrix
+  embed_layer = TokenEmbedding(vocab_size, d_model)
+
+  # Method 1: Index lookup
+  token_ids = torch.tensor([5, 42, 73])  # "Thanks for all" - example token indices
+  embeddings_lookup = embed_layer(token_ids)  # Direct index → vector lookup
+  print(f"Lookup method shape: {embeddings_lookup.shape}")  # [3, 16]
+  print(f"embeddings_lookup (transposed):\n {embeddings_lookup.detach().numpy().T}\n")
+
+  # Method 2: One-hot multiplication
+  one_hot = F.one_hot(token_ids, num_classes=vocab_size).float()  # [3, 100] sparse matrix
+  print(f"One-hot shape: {one_hot.shape}")  # [3 tokens, 100 vocab_size]
+  print(f"One-hot shape:\n {one_hot.detach()}\n")
+
+  # Get embedding matrix
+  E = embed_layer.embedding.weight  # [vocab_size, d_model] - the learned parameters
+  embeddings_matmul = one_hot @ E * math.sqrt(d_model)  # Matrix mult: [3,100] @ [100,16] = [3,16]
+  print(f"Matrix multiplication shape: {embeddings_matmul.shape}")
+  print(f"Matrix multiplication (transposed):\n  {embeddings_matmul.detach().numpy().T}\n ")
+
+  # Verify they're the same
+  assert torch.allclose(embeddings_lookup, embeddings_matmul)  # Both methods are mathematically equivalent
+  print("Methods produce identical results!")
+
+  # Visualize
+  fig, axes = plt.subplots(1, 3, figsize=(30, 8))
+
+  # One-hot vectors
+  axes[0].imshow(one_hot.T, aspect='auto', cmap='Greys')  # Transpose for better visualization
+  axes[0].set_title('One-hot Vectors')
+  axes[0].set_xlabel('Token Position')
+  axes[0].set_ylabel('Vocabulary')
+
+  # Embedding matrix
+  axes[1].imshow(E[:20].detach().numpy(), aspect='auto', cmap='RdBu_r')  # Show first 20 words only
+  axes[1].set_title('Embedding Matrix E (first 20 words)')
+  axes[1].set_xlabel('Embedding Dimension')
+  axes[1].set_ylabel('Word Index')
+
+  # Result embeddings
+  axes[2].imshow(embeddings_lookup.detach().numpy().T, aspect='auto', cmap='viridis')  # Final embeddings
+  axes[2].set_title('Retrieved Embeddings')
+  axes[2].set_xlabel('Token Position')
+  axes[2].set_ylabel('Embedding Dimension')
+
+  plt.tight_layout()
+  plt.show()
+
+demonstrate_embedding_lookup()
+
+"""##Input Encoding: Positional Encodings
+
+##Sinusoidal positional encodings
+"""
+
+class PositionalEncoding(nn.Module):
+  """Positional coding using sinusoidal functions """
+
+  def __init__(self, d_model, max_len=5000, base=10000):
+    super().__init__()
+
+    # Create sinsoidal position encoding
+    pe = torch.zeros(max_len, d_model) # [max_len, d_model] - pre-compute for all positions
+    position = torch.arange(0,max_len).unsqueeze(1).float() # [max_len, 1] - position indices
+
+    # Create div_term for the sinusoidal pattern
+    div_term = torch.exp(torch.arange(0, d_model, 2).float() *   # Frequency term for each dimension
+                         -(math.log(base)/d_model)   )           # Higher dims -> lower frequency
+
+
+    print("\ndiv_term:", div_term, "\n")
+
+    # Apply sin to even indices
+    pe[:, 0::2] = torch.sin(position * div_term) # sin(pos/10000^(2i/d_model))
+    print(f"\nDiv_term (frequencies): {div_term[:4].numpy()}")
+    print(f"Example - Position 10:")
+    for i in range(3):
+      print(f"  dim_{2*i} = sin(10 × {div_term[i]:.4f}) = {pe[10, 2*i]:.4f}")
+
+
+    # Apply cos to odd indices
+    pe[:, 1::2] = torch.cos(position * div_term) # cos(pos/10000^(2i/d_model))
+    for i in range(3):
+      print(f"  dim_{2*i+1} = cos(10 × {div_term[i]:.4f}) = {pe[10, 2*i+1]:.4f}")
+
+    # Register as buffer (not a parameter)
+    self.register_buffer('pe', pe.unsqueeze(0)) # [1, max_len, d_model] - saved but not trained
+    print(f"\nPE shape: {pe.unsqueeze(0).shape} [batch=1, max_len={max_len}, d_model={d_model}]")
+
+
+  def forward(self, x):
+    """ Add Positional encoding to input embeddings"""
+
+    seq_len = x.size(1)
+    return(x + self.pe[:, :seq_len]) # Add positional embeddings
+
+"""##Absolute positional embeddings"""
+
+class LearnedPositionalEmbedding(nn.Module):
+  """Learned positional embeddings (Absolute Position)"""
+
+  def __init__(self, max_len, d_model):
+    super().__init__()
+    self.pos_embedding = nn.Embedding(max_len, d_model)  # Learnable lookup table for positions
+
+
+  def forward(self, x):
+    seq_len = x.size(1)
+    positions = torch.arange(seq_len, device = x.device)  # [0, 1, 2, ..., seq_len-1]
+
+    return( x + self.pos_embedding(positions))  # Add learned position vectors
+
+"""### Compare positional encoding methods
+
+"""
+
+def compare_positional_encodings():
+  """Visualize different positional encoding strategies"""
+
+  d_model = 128  # Embedding dimension
+  max_len = 100  # Maximum sequence length
+
+  # Sinusoidal encoding
+  sine_pe = PositionalEncoding(d_model, max_len)  # Fixed mathematical formula
+
+  # Learned encoding
+  learned_pe = LearnedPositionalEmbedding(max_len, d_model)  # Trainable parameters
+
+  # Get encodings
+  dummy_input = torch.zeros(1, max_len, d_model)  # Dummy input for shape
+  sine_encoding = sine_pe.pe[0, :max_len, :].numpy()  # Extract sinusoidal patterns
+  learned_encoding = learned_pe.pos_embedding.weight.detach().numpy()  # Extract learned embeddings
+
+  # Print shapes and sample values
+  print(f"=== POSITIONAL ENCODING SHAPES ===")
+  print(f"Sinusoidal encoding shape: {sine_encoding.shape} [positions, d_model]")
+  print(f"Learned encoding shape: {learned_encoding.shape} [positions, d_model]")
+
+  print(f"\n=== SAMPLE ENCODINGS (first 3 positions, first 8 dims) ===")
+  print(f"Sinusoidal encoding (positions 0-2):")
+  print(f"{sine_encoding[:3, :8]}")
+
+  print(f"\nLearned encoding (positions 0-2):")
+  print(f"{learned_encoding[:3, :8]}")
+
+  print(f"\n=== ENCODING PATTERNS ===")
+  print(f"Sine encoding at pos=0: min={sine_encoding[0].min():.3f}, max={sine_encoding[0].max():.3f}")
+  print(f"Sine encoding at pos=50: min={sine_encoding[50].min():.3f}, max={sine_encoding[50].max():.3f}")
+  print(f"Notice: Sinusoidal values stay bounded in [-1, 1]")
+
+  print(f"\n=== FREQUENCY ANALYSIS ===")
+  print(f"Dimension 0 (high freq): changes from {sine_encoding[0, 0]:.3f} to {sine_encoding[1, 0]:.3f} (Δ={abs(sine_encoding[1, 0] - sine_encoding[0, 0]):.3f})")
+  print(f"Dimension 126 (low freq): changes from {sine_encoding[0, 126]:.3f} to {sine_encoding[1, 126]:.3f} (Δ={abs(sine_encoding[1, 126] - sine_encoding[0, 126]):.3f})")
+  print(f"Lower dimensions change faster between positions!")
+
+  # Visualize
+  fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+  # Sinusoidal pattern
+  axes[0, 0].imshow(sine_encoding[:50].T, aspect='auto', cmap='RdBu_r')  # Show wave patterns
+  axes[0, 0].set_title('Sinusoidal Positional Encoding')
+  axes[0, 0].set_xlabel('Position')
+  axes[0, 0].set_ylabel('Dimension')
+
+  # Learned pattern
+  axes[0, 1].imshow(learned_encoding[:50].T, aspect='auto', cmap='RdBu_r')  # Random init patterns
+  axes[0, 1].set_title('Learned Positional Embedding')
+  axes[0, 1].set_xlabel('Position')
+  axes[0, 1].set_ylabel('Dimension')
+
+  # Sinusoidal patterns for specific dimensions
+  positions = np.arange(100)
+  for i in range(0, 8, 2):  # Show different frequency waves
+    axes[1, 0].plot(positions, sine_encoding[:, i], label=f'dim {i}')
+  axes[1, 0].set_title('Sinusoidal Patterns (Different Frequencies)')
+  axes[1, 0].set_xlabel('Position')
+  axes[1, 0].legend()
+  axes[1, 0].grid(True, alpha=0.3)
+
+  # Similarity matrix for positions
+  from sklearn.metrics.pairwise import cosine_similarity
+  sim_matrix = cosine_similarity(sine_encoding[:20])  # How similar are different positions?
+
+  print(f"\n=== POSITION SIMILARITY ===")
+  print(f"Similarity matrix shape: {sim_matrix.shape}")
+  print(f"Similarity between pos 0 and pos 1: {sim_matrix[0, 1]:.3f}")
+  print(f"Similarity between pos 0 and pos 10: {sim_matrix[0, 10]:.3f}")
+  print(f"Similarity between pos 0 and pos 19: {sim_matrix[0, 19]:.3f}")
+  print(f"Notice: Nearby positions are more similar!")
+
+  axes[1, 1].imshow(sim_matrix, cmap='RdBu_r')
+  axes[1, 1].set_title('Position Similarity Matrix')
+  axes[1, 1].set_xlabel('Position')
+  axes[1, 1].set_ylabel('Position')
+  axes[1, 1].colorbar = plt.colorbar(axes[1, 1].images[0], ax=axes[1, 1])
+
+  plt.tight_layout()
+  plt.show()
+
+  print("\nKEY PROPERTIES")
+  print("Sinusoidal encoding properties:")
+  print("- Deterministic (no parameters to learn)")  # Always same pattern
+  print("- Can extrapolate to longer sequences")  # Works for any length
+  print("- Different frequencies for different dimensions")  # Low->high freq across dims
+  print("\nLearned encoding properties:")
+  print("- Flexible, can learn task-specific patterns")  # Adapts to data
+  print("- Requires training data for each position")  # Must see positions during training
+  print("- Limited to maximum sequence length seen during training")  # Can't extend
+
+compare_positional_encodings()
+
