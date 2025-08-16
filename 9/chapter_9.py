@@ -1272,7 +1272,9 @@ class PositionalEncoding(nn.Module):
     seq_len = x.size(1)
     return(x + self.pe[:, :seq_len]) # Add positional embeddings
 
-"""##Absolute positional embeddings"""
+"""##Absolute positional encodings
+
+"""
 
 class LearnedPositionalEmbedding(nn.Module):
   """Learned positional embeddings (Absolute Position)"""
@@ -1386,4 +1388,300 @@ def compare_positional_encodings():
   print("- Limited to maximum sequence length seen during training")  # Can't extend
 
 compare_positional_encodings()
+
+"""# RoPE (Rotary Positional Embedding)
+
+RoPE encodes position information by **rotating vectors** instead of adding position embeddings. Each token's representation is treated as points on multiple 2D planes that undergo rotation based on sequence position.
+
+## Core Principle
+
+Position encoding methods comparison:
+```
+Traditional: x'_m = x_m + p_m (additive)
+RoPE:        x'_m = R_Θ,m · x_m (multiplicative rotation)
+```
+
+## Mechanism
+
+### 1. Dimension Pairing
+A d-dimensional vector is partitioned into d/2 consecutive pairs ():
+```
+x = [x_0, x_1, x_2, x_3, ..., x_{d-1}]
+Pairs: {(x_0,x_1), (x_2,x_3), ..., (x_{d-2},x_{d-1})}
+
+
+x1 = x[..., ::2]   # Even dims [0,2,4,...]: "real" parts (x coords)      [x0, x2, x4...]
+x2 = x[..., 1::2]  # Odd dims [1,3,5,...]:  "imaginary" parts (y coords) [x1, x3, x5...]
+
+```
+
+### 2. Position-Dependent Rotation
+Each pair undergoes rotation by angle θ_i · m for position m:
+```
+θ_i = 10000^(-2i/d) where i ∈ {0, 1, ..., d/2-1}
+Rotation angle at position m: θ_i · m
+```
+
+### 3. Frequency Distribution
+Rotation frequencies decrease exponentially with dimension index:
+```
+Dimensions 0-1: θ_0 = 1 (highest frequency)
+Dimensions 2-3: θ_1 = 10000^(-2/d)
+...
+Dimensions (d-2)-(d-1): θ_{d/2-1} = 10000^(-1+2/d) (lowest frequency)
+```
+
+## Mathematical Formulation
+
+**2D Rotation Matrix:**
+For each pair (x_{2i}, x_{2i+1}), the rotation matrix R_θ is:
+```
+R_θ = [cos(θ)  -sin(θ)]
+      [sin(θ)   cos(θ)]
+```
+
+**Block-Diagonal Structure:**
+The complete rotation matrix R_Θ,m for position m:
+```
+R_Θ,m = diag(R_{θ_0·m}, R_{θ_1·m}, ..., R_{θ_{d/2-1}·m})
+```
+
+**Efficient Implementation:**
+```
+f_q(x_m, m) = R_Θ,m W_q x_m
+f_k(x_m, m) = R_Θ,m W_k x_m
+```
+
+Where the rotation is computed as:
+```
+q̃ = q ⊙ cos(mΘ) + q_⊥ ⊙ sin(mΘ)
+```
+with q_⊥ representing the element-wise rearrangement [-q_{2i+1}, q_{2i}].
+
+## Relative Position Property
+
+**Theorem:** The attention score between positions m and n depends only on their relative distance:
+
+```
+⟨f_q(x_m, m), f_k(x_n, n)⟩ = ⟨R_Θ,m W_q x_m, R_Θ,n W_k x_n⟩
+                            = ⟨W_q x_m, R_Θ,m^T R_Θ,n W_k x_n⟩
+                            = ⟨W_q x_m, R_Θ,n-m W_k x_n⟩
+```
+
+This demonstrates that the dot product depends on (n-m) rather than absolute positions.
+
+## Computational Advantages
+
+1. **Parameter-free**: No learnable position embeddings (memory efficient)
+2. **Magnitude preservation**: ||R_Θ,m x|| = ||x|| (rotation preserves L2 norm)
+3. **Extrapolation capability**: Valid for any sequence length
+4. **Relative position encoding**: Inherent through rotation composition
+
+## Implementation
+
+```python
+def apply_rotary_embedding(x, position):
+    # Compute base frequencies
+    dim = x.shape[-1]
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2) / dim))
+    
+    # Generate rotation angles
+    theta = position * inv_freq
+    cos_m = theta.cos()
+    sin_m = theta.sin()
+    
+    # Apply rotation
+    x_rot = torch.zeros_like(x)
+    x_rot[..., 0::2] = x[..., 0::2] * cos_m - x[..., 1::2] * sin_m
+    x_rot[..., 1::2] = x[..., 0::2] * sin_m + x[..., 1::2] * cos_m
+    
+    return x_rot
+```
+
+## Summary
+
+RoPE achieves position encoding through geometric rotation in embedding space, eliminating trainable parameters while naturally encoding relative positions through the mathematical properties of rotation composition. This approach has been adopted in modern architectures including LLaMA and GPT-NeoX due to its theoretical elegance and practical efficiency.
+"""
+
+class RotaryPositionalEmbedding(nn.Module):
+ """Rotary Position Embedding (RoPE) - used in LLaMA, GPT-NeoX
+
+ RoPE encodes position by rotating vector pairs instead of adding embeddings.
+ Think of it like clock hands - each position rotates vectors by different angles.
+
+ Paper: "RoFormer: Enhanced Transformer with Rotary Position Embedding" (Su et al., 2021)
+ """
+
+ def __init__(self, dim, max_len=5000, base=10000):
+   super().__init__()
+   self.dim = dim  # Head dimension (e.g., 64 for each attention head)
+   self.base = base  # Controls rotation speed - higher = slower rotation
+
+   # Create rotation frequencies for each dimension pair
+   # From paper: θ_i = 10000^(-2i/d) where i ∈ [0, 1, ..., d/2-1]
+   # This creates frequencies: [1, 1/10000^(2/d), 1/10000^(4/d), ...]
+   inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+   self.register_buffer('inv_freq', inv_freq)  # Save but don't train
+
+   # Precompute all rotation angles for all positions
+   # From paper: For position m, angles are m·θ_i for each frequency θ_i
+   t = torch.arange(max_len).float()  # Position indices: [0, 1, 2, ...]
+   freqs = torch.outer(t, inv_freq)  # [max_len, dim/2] - computes m·θ_i
+
+   # Store cos(m·θ_i) and sin(m·θ_i) for each position m
+   # Paper uses: R_Θ,m = [[cos(mθ_i), -sin(mθ_i)], [sin(mθ_i), cos(mθ_i)]]
+   cos_cached = freqs.cos().repeat_interleave(2, dim=-1)  # [max_len, dim]
+   sin_cached = freqs.sin().repeat_interleave(2, dim=-1)  # [max_len, dim]
+   self.register_buffer('cos_cached', cos_cached)
+   self.register_buffer('sin_cached', sin_cached)
+
+ def rotate_half(self, x):
+   """Rearrange vector for 2D rotation formula
+
+   Paper notation: For complex number (x + iy), rotation by θ gives:
+   (x + iy) * e^(iθ) = (x·cos(θ) - y·sin(θ)) + i(x·sin(θ) + y·cos(θ))
+
+   This function prepares the [-y, x] part for the rotation matrix multiplication.
+   """
+   x1 = x[..., ::2]   # Even dims [0,2,4,...]: "real" parts (x coords)      [x0, x2, x4...]
+   x2 = x[..., 1::2]  # Odd dims [1,3,5,...]:  "imaginary" parts (y coords) [x1, x3, x5...]
+
+   return torch.cat([-x2, x1], dim=-1)  # Returns [-y, x] to enable (x+iy)*e^(iθ) rotation
+
+
+ def forward(self, q, k, start_pos=0):
+   """Apply rotary embeddings to Q and K (but not V!)
+
+   Paper formula for rotating query at position m:
+   q̃_m = R_Θ,m · W_q · x_m
+
+   Where R_Θ,m is the block-diagonal rotation matrix:
+   R_Θ,m = diag(R_1, R_2, ..., R_{d/2}) with each R_i being a 2×2 rotation matrix
+
+   The implementation efficiently computes this as:
+   q̃ = q · cos(mΘ) + rotate_half(q) · sin(mΘ)
+   """
+   seq_len = q.shape[1]
+
+   # Get precomputed cos(mΘ) and sin(mΘ) for positions
+   cos = self.cos_cached[start_pos:start_pos + seq_len]  # [seq_len, dim]
+   sin = self.sin_cached[start_pos:start_pos + seq_len]
+
+   # Add batch and head dimensions for broadcasting
+   cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, dim]
+   sin = sin.unsqueeze(0).unsqueeze(2)
+
+   # Apply rotation using the efficient formula from paper
+   # This implements: R_Θ,m · q = q·cos(mΘ) + (−q_{odd}, q_{even})·sin(mΘ)
+   q_rot = q * cos + self.rotate_half(q) * sin
+   k_rot = k * cos + self.rotate_half(k) * sin
+
+   return q_rot, k_rot
+
+def compare_all_position_methods():
+  """Compare three ways to encode position in transformers
+
+  Mathematical comparison:
+  1. Learned PE: x' = x + P[pos] where P is learned matrix
+  2. Sinusoidal: x' = x + PE(pos) where PE uses sin/cos formulas
+  3. RoPE: q' = R(pos)·q, k' = R(pos)·k where R is rotation matrix
+  """
+
+  # Model dimensions
+  d_model = 128      # Total embedding size
+  seq_len = 50       # Sequence length
+  batch_size = 2     # Batch size
+  n_heads = 8        # Attention heads
+  head_dim = d_model // n_heads  # Dimension per head (16)
+
+  # Create dummy Q and K tensors for demonstration
+  q = torch.randn(batch_size, seq_len, n_heads, head_dim)
+  k = torch.randn(batch_size, seq_len, n_heads, head_dim)
+
+  # Initialize three position encoding methods
+  learned_pe = LearnedPositionalEmbedding(seq_len, d_model)  # Like BERT/GPT
+  sine_pe = PositionalEncoding(d_model, seq_len)  # Original Transformer
+  rope = RotaryPositionalEmbedding(head_dim, seq_len)  # Modern LLMs (LLaMA)
+
+  # Apply RoPE (only rotates, doesn't add)
+  q_rot, k_rot = rope(q, k)
+
+  print("=== POSITION ENCODING COMPARISON ===\n")
+
+  print("1. LEARNED ABSOLUTE EMBEDDINGS (BERT/GPT style):")
+  print(f"   Math: x'_m = x_m + p_m where p_m ∈ ℝ^d is learned")
+  print(f"   Parameters: {seq_len * d_model:,} (must be trained)")
+  print(f"   Sample values: {learned_pe.pos_embedding.weight[0, :5].detach().numpy()}")
+
+  print("\n2. SINUSOIDAL ENCODINGS (Original Transformer):")
+  print(f"   Math: PE(pos,2i) = sin(pos/10000^(2i/d))")
+  print(f"        PE(pos,2i+1) = cos(pos/10000^(2i/d))")
+  print(f"   Parameters: 0 (deterministic formula)")
+  print(f"   Sample values: {sine_pe.pe[0, 0, :5].numpy()}")
+
+  print("\n3. ROTARY POSITION EMBEDDINGS - RoPE (LLaMA/GPT-Neo):")
+  print(f"   Math: q̃_m = R_Θ,m · q_m where R_Θ,m is rotation matrix")
+  print(f"   Attention: q̃_m^T k̃_n = q_m^T R_Θ,n-m k_n (relative position!)")
+  print(f"   Parameters: 0 (pure rotation)")
+  print(f"   Input Q shape: {q.shape} → Output: {q_rot.shape} (unchanged!)")
+
+  # Visualize the three methods
+  fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+  # Plot 1: Learned embeddings (random at init, becomes meaningful after training)
+  learned_encoding = learned_pe.pos_embedding.weight[:20, :64].detach().numpy()
+  axes[0].imshow(learned_encoding.T, aspect='auto', cmap='RdBu_r')
+  axes[0].set_title('Learned Embeddings\n(Random → Trained)')
+  axes[0].set_xlabel('Position')
+  axes[0].set_ylabel('Dimension')
+
+  # Plot 2: Sinusoidal patterns (notice the wave patterns)
+  sine_encoding = sine_pe.pe[0, :20, :64].numpy()
+  axes[1].imshow(sine_encoding.T, aspect='auto', cmap='RdBu_r')
+  axes[1].set_title('Sinusoidal Patterns\n(Fixed Waves)')
+  axes[1].set_xlabel('Position')
+  axes[1].set_ylabel('Dimension')
+
+  # Plot 3: RoPE rotation angles (cos values showing rotation patterns)
+  angles = rope.cos_cached[:20, :32].numpy()
+  axes[2].imshow(angles.T, aspect='auto', cmap='RdBu_r')
+  axes[2].set_title('RoPE Rotations\n(cos(mθ) values)')
+  axes[2].set_xlabel('Position m')
+  axes[2].set_ylabel('Frequency i')
+
+  plt.tight_layout()
+  plt.show()
+
+  print("\n=== KEY MATHEMATICAL PROPERTIES ===")
+  print("LEARNED: PE is additive: f(x_m) = x_m + p_m")
+  print("         → Just adds a learned vector to each position")
+  print("\n")
+
+  print("SINUSOIDAL: PE is additive with fixed frequencies: f(x_m) = x_m + sin/cos(mθ)")
+  print("            → Adds predetermined wave patterns")
+  print("\n")
+
+  print("RoPE: PE is multiplicative (rotation): f(x_m) = R_Θ,m · x_m")
+  print("      → Rotates vectors by position-dependent angles")
+  print("\n")
+
+  print("\n=== RoPE's KEY THEOREM: RELATIVE POSITION ===")
+  print("Paper's key insight: When we compute attention between positions m and n:")
+  print("")
+  print("⟨q̃_m, k̃_n⟩ = ⟨R_Θ,m q_m, R_Θ,n k_n⟩      # Dot product of rotated vectors")
+  print("           = ⟨q_m, R_Θ,m^T R_Θ,n k_n⟩    # Move rotation to one side")
+  print("           = ⟨q_m, R_Θ,n-m k_n⟩          # Rotations combine to difference")
+  print("")
+  print("This means: Attention(pos_m, pos_n) only depends on distance (n-m), not absolute positions")
+  print("\n")
+
+  pos1, pos2 = 5, 8
+  distance = pos2 - pos1
+  cos_diff = rope.cos_cached[distance, :5]
+  print(f"\nExample: Rotation between pos {pos1} and {pos2} = R_Θ,{distance}")
+  print(f"cos(θ·{distance}) for first 5 dims: {cos_diff.numpy()}")
+
+compare_all_position_methods()
+
+
 
