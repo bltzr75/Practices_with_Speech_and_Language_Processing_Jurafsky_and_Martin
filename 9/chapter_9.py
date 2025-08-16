@@ -571,7 +571,7 @@ class FeedForward(nn.Module):
     self.activation = nn.ReLU() if activation =='relu' else nn.GELU() # GELU: smoother, differentiable everywhere
     self.activation_name = activation
 
-    print(f"FFN: {d_model} → {d_ff} → {d_model} with {activation}")
+    print(f"\nFFN: {d_model} → {d_ff} → {d_model} with {activation}")
 
 
   def forward(self,x):
@@ -1246,12 +1246,12 @@ class PositionalEncoding(nn.Module):
                          -(math.log(base)/d_model)   )           # Higher dims -> lower frequency
 
 
-    print("\ndiv_term:", div_term, "\n")
+    print("\nPE div_term:\n", div_term, "\n")
 
     # Apply sin to even indices
     pe[:, 0::2] = torch.sin(position * div_term) # sin(pos/10000^(2i/d_model))
-    print(f"\nDiv_term (frequencies): {div_term[:4].numpy()}")
-    print(f"Example - Position 10:")
+    print(f"\nPE Div_term (frequencies):\n {div_term[:4].numpy()}")
+    print(f"PE Example - Position 10:")
     for i in range(3):
       print(f"  dim_{2*i} = sin(10 × {div_term[i]:.4f}) = {pe[10, 2*i]:.4f}")
 
@@ -1263,7 +1263,7 @@ class PositionalEncoding(nn.Module):
 
     # Register as buffer (not a parameter)
     self.register_buffer('pe', pe.unsqueeze(0)) # [1, max_len, d_model] - saved but not trained
-    print(f"\nPE shape: {pe.unsqueeze(0).shape} [batch=1, max_len={max_len}, d_model={d_model}]")
+    print(f"\nPE shape:\n {pe.unsqueeze(0).shape} [batch=1, max_len={max_len}, d_model={d_model}]")
 
 
   def forward(self, x):
@@ -2096,9 +2096,9 @@ def demonstrate_logit_lens():
 
 demonstrate_logit_lens()
 
-print("The Model should be Trained on actual data in order to see the LogLens evolve")
+print("\nThe Model should be Trained on actual data in order to see the LogLens evolve")
 
-print(""" With 10 Layers:
+print("""\nWith 10 Layers:
 LogitLens on this untrained transformer shows near-uniform probability distributions
 across all layers with randomly changing token predictions - a stark contrast to
 trained models where early layers show high-entropy uncertainty that progressively
@@ -2108,10 +2108,10 @@ through the residual stream in trained transformers.
 """)
 
 
-print("""With 100 Layers:
+print("""\nWith 100 Layers:
 LogitLens on this untrained transformer reveals emergent structure from random weights:
-early layers show unstable token predictions that converge to a dominant token (55)
-for 35+ consecutive layers, with confidence peaking mid-network before collapsing back
+early layers show unstable token predictions that converge to a dominant token
+for many consecutive layers, with confidence peaking mid-network before collapsing back
 to near-uniform at the output. Unlike trained models where entropy decreases as
 understanding builds, here entropy rises then falls - reflecting mathematical artifacts
 from compounding random transformations rather than meaningful information refinement.
@@ -2119,4 +2119,302 @@ These patterns (stable attractors, oscillating confidence) demonstrate how deep 
 networks create statistical regularities that superficially mimic but fundamentally
 differ from the incremental understanding in trained transformers.
 """)
+
+
+print("""\n
+Key principle: LogitLens must be applied to a trained model during inference to see meaningful patterns.
+Using it before or during training only shows noise or unstable learning dynamics.
+The ideal spot is right after training completes, analyzing how the trained model processes
+specific prompts to reveal the learned hierarchical representations - early layers showing uncertainty
+that progressively refines into confident predictions in later layers.
+""")
+
+"""# Full Transformer Language Model"""
+
+class TransformerLM(nn.Module):
+  """
+  Compete trnasformer language model (Decoder-Only)
+  Implements GPT-stype arch:token embed -> pos encoding -> N transformers blocks -> layer norm -> lang model head
+
+  No encoder, only causal self-attention for autorregressivne generation
+  """
+
+  def __init__(self, vocab_size, d_model=512, n_layers=6, n_heads = 8,
+               d_ff=2048, max_len=5000, dropout=0.1, weight_tying=True ): # d_ff dim of the feed forward usually 4*d_model
+    super(TransformerLM, self).__init__()
+
+
+    print(f"\nInitializing TransformerLM:")
+    print(f"  vocab_size={vocab_size}, d_model={d_model}, n_layers={n_layers}")
+    print(f"  n_heads={n_heads}, d_head={d_model//n_heads}, d_ff={d_ff}")
+    print(f"  weight_tying={weight_tying}\n")
+
+    # Input layers: token ids -> dense vectors
+    self.token_embedding = TokenEmbedding(vocab_size, d_model)
+    self.pos_encoding = PositionalEncoding(d_model, max_len) # PE(pos, 2i) = sin(pos/10000^(2i/d))
+
+    # Stack transformers blocks: each adds increm understanding
+    # h_l = h_{h-1} + TrnasformerBlock(h_{l-1}) - residual connecitons inside each block
+    self.transformer_blocks = nn.ModuleList([
+        TransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)
+    ])
+
+    print(f"\nCreated {n_layers} transformer blocks, each with:")
+    print(f"  MHA params: {3*d_model*d_model + d_model*d_model} (QKV + O projections)")
+    print(f"  FFN params: {d_model*d_ff + d_ff*d_model} (2 linear layers)\n")
+
+    # Final layer norm: stabilization before projection
+    self.ln_final = nn.LayerNorm(d_model) # (x - μ) / σ * γ + β
+
+    # Language modeling head: project hidden states -> vocab logits
+    # With weight_tying true: reuses embedding matrix E^T for memory efficiency
+    self.lm_head = LanguageModelingHead(
+        d_model, vocab_size, weight_tying=weight_tying,
+        embedding_layer=self.token_embedding if weight_tying else None
+        )
+
+    if weight_tying:
+      print(f"\nWeight tying enabled: sharing {vocab_size*d_model} parameters")
+      print(f"  Embedding: tokens -> vectors via E[token_id]")
+      print(f"  Unembedding: vectors -> logits via vector @ E^T\n")
+
+    self.dropout = nn.Dropout(dropout) # Regularization on training
+    self.d_model = d_model
+    self.n_layers = n_layers
+
+    # Initialize parameters for stable training
+    self._init_parameters()
+
+    total_params = sum(p.numel() for p in self.parameters())
+    print(f"Total parameters: {total_params:,} ({total_params/1e6:.1f}M)\n")
+
+  def _init_parameters(self):
+    """
+    Initialize params with Xavier Uniform
+
+    Xavier/Glorot initialization: Var(W) = 2/(n_in + n_out)
+    Maintains variance across layers, prevents vanishing/exploding gradients
+    """
+
+    for p in self.parameters():
+      if p.dim() > 1:# Only for weight matrices, not biases/scalars
+        nn.init.xavier_uniform_(p)
+
+
+  def forward(self, input_ids, targets=None, return_all_hidden=False):
+    """
+    input_ids: [batch, seq_len] token indices
+    targets: [batch, seq_len] next token labels (optional, for training)
+    Returns: logits [batch, seq_len, vocab_size] and optionally loss
+
+    Information flow: tokens -> embeddings -> N transformers layers -> logits
+    """
+
+    batch_size, seq_len = input_ids.shape
+    print(f"\nForward pass: batch={batch_size}, seq_len={seq_len}")
+
+
+    # Create causal mask: prevents attending to fut tokens
+    # mask[i,j] = 1 if i >= j (can attend), 0 if i < j (cannot attend)
+    mask = torch.tril(torch.ones(seq_len, seq_len, device=input_ids.device)) # lower triangle
+
+    # Token embeddings: discrete tokens -> continuous vectors
+    # x[i] = E[input_ids[i]] where E ∈ R^{vocab_size × d_model}
+    x = self.token_embedding(input_ids) # [batch, seq_len] -> [batch, seq_len, d_model]
+    print(f"After embedding: {x.shape}, norm={x.norm(dim=-1).mean():.3f}")
+
+    # Adding positional information: x = x + PE(pos)
+    # Order awareness
+    x = self.pos_encoding(x) # x + sin/cos(pos/10000^(2i/d))
+    print(f"After pos encoding: {x.shape}, norm={x.norm(dim=-1).mean():.3f}")
+
+    x = self.dropout(x) # Regularization
+
+    # Collecting hidden states for analysis and logitlens
+    hidden_states = [x.clone()] if return_all_hidden else []
+
+    # Pass through transformer blocks
+    # Each block: x_new = x_old + MHA(LN(x_old)) + FFN(LN(x_old + MHA)) ##(LN-Layer Normamlization;MHA-Mult Head Attn)
+    for i, block in enumerate(self.transformer_blocks):
+      x_before = x.clone()
+      x, attn_weights = block(x,mask) # Self-attn + FFN with Residuals
+
+      # Measure transformation magnitude
+      delta_norm = (x-x_before).norm() / x_before.norm()
+      print(f"After block {i}: norm={x.norm(dim=-1).mean():.3f}, change={delta_norm:.4f}")
+
+      if return_all_hidden:
+        hidden_states.append(x.clone())
+
+    # Final layer norm before projection to vocab
+    x = self.ln_final(x)  # Stabilize gradients: (x - μ) / σ * γ + β
+    print(f"After final LN: {x.shape}, norm={x.norm(dim=-1).mean():.3f}")
+
+    if return_all_hidden:
+      hidden_states.append(x.clone())
+
+    # Project to vocabulary: hidden state4s -> logits for each token
+    # logits[b,t,v] = probability score for token v at position-time t in batch b
+    print(f"\nComputing logits: {x.shape} @ W_lm^T")  # [B,L,d] @ [d,V]
+    logits = self.lm_head(x)  # [batch, seq_len, d_model] -> [batch, seq_len, vocab_size]
+    print(f"Logits: {logits.shape}, range=[{logits.min():.2f}, {logits.max():.2f}]")
+
+    # Calc loss if targets provided (for training)
+    loss = None
+    if targets is not None:
+      # Flatten Cross Entropy, compare pred vs actual next token
+      logits_view = logits.view(-1, logits.size(-1))  # [batch*seq_len, vocab_size]  #view() reshapes the tensor without copying memory, similar to numpy's reshape() # view(-1) 1-dimensional (1D) array, effectively "flattening". #In PyTorch, the equivalent of NumPy's size (which returns the total number of elements in an array) is torch.numel()
+      targets_view = targets.view(-1) # [batch*seq_len]
+
+      # Cross entropy loss -Σ y_true * log(softmax(y_pred))
+      loss = F.cross_entropy(logits_view, targets_view, ignore_index=-100 )
+      print(f"Loss: {loss.item():.4f} (perplexity={torch.exp(loss).item():.2f})")
+
+    if return_all_hidden:
+      return logits, loss, hidden_states
+    else:
+      return logits,loss
+
+  @torch.no_grad()
+  def generate(self, input_ids, max_length=100, temperature=1.0, top_k=50, top_p=0.95):
+    """
+    Generate text using diff sampling strategies
+
+    Autoregressive generation: P(x_t|x_<t) via causal attention
+    Sampling strategies balance quality vs diversity
+    """
+
+    self.eval() #In PyTorch, self.eval() (or more commonly, model.eval()) is a method called on a torch.nn.Module instance to set the model to "evaluation mode." .During training, dropout layers randomly set a fraction of neurons to zero to prevent overfitting. In evaluation mode, model.eval() ensures that dropout layers are disabled, meaning all neurons are active, which is necessary for consistent and accurate predictions.
+    device = input_ids.device
+
+    print(f"\nGenerating: max_length={max_length}, temp={temperature}, top_k={top_k}, top_p={top_p}")
+    print(f"Starting from {input_ids.shape[1]} tokens")
+
+    for step in range(max_length - input_ids.size(1)):   #tensor.size(1) returns the size of the second dimension of a given tensor
+      # Get logits for next token: only needs the last position
+      logits, _ = self.forward(input_ids) # [batch, seq_len, vocab_size]
+      logits = logits[:,-1,:] / temperature # scaling by temp, high vals flatten the distrib while close to zero is more deterministic
+
+      if step == 0:
+        print(f"Step {step}: logits {logits.shape}, range=[{logits.min():.2f}, {logits.max():.2f}]")
+
+      # Apply top-k filtering
+      if top_k > 0:
+        # k top threshold
+        top_k_values = torch.topk(logits, top_k)[0] # [batch,k]
+        threshold = top_k_values[..., -1, None] # [batch, 1]
+        indices_to_remove = logits < threshold # Boolean mask
+        logits[indices_to_remove] = -float('inf') # Zero prob after softmax
+
+        if step == 0:
+          print(f"  Top-k filtered: keeping {top_k}/{logits.size(-1)} tokens")
+
+      # Apply top-p (nucleus) filtering: smallest set with cumsum(P) > p
+      if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1),  dim=-1)
+
+
+        # Cutoff: where cumsum exceeds p
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0 # Keep at least one token
+
+        # Map back to original indices
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = -float('inf')
+
+        if step == 0:
+          kept = (~indices_to_remove).sum().item()
+          print(f"  Top-p filtered: keeping {kept}/{logits.size(-1)} tokens (cumsum>{top_p})")
+
+
+      # Sample from filtered distribution
+      probs = F.softmax(logits, dim=-1) # Convert to probs
+      next_token = torch.multinomial(probs, num_samples = 1) # Sample token predicted
+
+
+      if step == 0:
+        max_prob_token = probs.argmax(dim=-1)
+        max_prob = probs.max(dim=-1)[0]
+        print(f"  Sampled token {next_token[0,0]} (max prob token={max_prob_token[0]}, P={max_prob[0]:.3f})")
+
+
+      # Append to sequence for next iteration
+      input_ids = torch.cat([input_ids, next_token], dim=1) # [batch, seq_len+1]
+
+    print(f"Generated {input_ids.shape[1]} total tokens\n")
+
+    return(input_ids)
+
+"""# Test the Full Transformer LM
+
+"""
+
+def test_transformer_lm():
+  """Test the complete transformer lang model"""
+
+  # Model config Hyperparams
+  config = {
+      'vocab_size':1000,
+      'd_model':256,
+      'n_layers':4,
+      'n_heads':8, # Attention heads (d_head = 256/8 = 32)
+      'd_ff':1024, # # FFN intermediate dimension, usually  d_model * n_layers (d_model * 4)
+      'max_len': 512,
+      'dropout':0.1
+      }
+  print(f"\nModel Configuration:")
+  for k,v in config.items():
+    print(f"{k}:{v}")
+    print("\n")
+
+  # Model instance
+  model = TransformerLM(**config)
+  param_count = sum(p.numel() for p in model.parameters())
+  print(f"Model created with {param_count:,} parameters")
+  print(f"Memory estimate: {param_count * 4 / 1024**2:.1f} MB (float32)\n")  #Estimate model memory: param_count x 4 bytes (float32) -> convert to MB (/1024**2)
+
+  # Test Forward Pass
+  batch_size, seq_len = 2,50
+  input_ids = torch.randint(0, config['vocab_size'], (batch_size, seq_len))
+  targets = torch.randint(0, config['vocab_size'], (batch_size, seq_len))
+
+  print(f"Testing forward pass:")
+  print(f"  Input: {input_ids.shape} (random token ids)")
+  print(f"  Sample input tokens: {input_ids[0, :10].tolist()}\n")
+
+  logits, loss = model(input_ids, targets)
+  print(f"\nForward pass results:")
+  print(f"  Input shape: {input_ids.shape}")
+  print(f"  Logits shape: {logits.shape}")  # [batch, seq_len, vocab_size]
+  print(f"  Loss: {loss.item():.4f}")
+  print(f"  Perplexity: {torch.exp(loss).item():.2f}\n")
+
+  # Verify valid probs
+  probs = F.softmax(logits[0,0], dim=-1) # First token, first batch
+  print(f"  Prob sum check: {probs.sum():.6f} (should be 1.0)")
+  print(f"  Top-5 probs: {probs.topk(5)[0].tolist()}\n")
+
+  # Test generation
+  prompt = torch.randint(0,config['vocab_size'], (1,5))
+  print(f"\nTesting generation:")
+  print(f"  Prompt tokens: {prompt[0].tolist()}\n")
+
+  generated = model.generate(prompt, max_length=20, temperature=0.8)
+  print(f"\nGeneration results:")
+  print(f"  Prompt length: {prompt.size(1)}")
+  print(f"  Generated length: {generated.size(1)}")
+  print(f"  Generated tokens: {generated[0].tolist()}")
+  print(f"  New tokens: {generated[0, prompt.size(1):].tolist()}\n")
+
+  # Model summary
+  print("\nModel Architecture Summary:")
+  summary(model, input_data=input_ids, verbose=0,
+          col_names=['input_size', 'output_size', 'num_params'])
+
+  return model
+
+
+model = test_transformer_lm()
 
