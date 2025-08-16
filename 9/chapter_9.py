@@ -1683,5 +1683,440 @@ def compare_all_position_methods():
 
 compare_all_position_methods()
 
+"""#Language Modeling Head: Unembedding and Output Projection"""
 
+class LanguageModelingHead(nn.Module):
+  """LM Head with Weight Tying option"""
+
+  def __init__(self, d_model, vocab_size, weight_tying=True,embedding_layer=None):
+    super(LanguageModelingHead, self).__init__()
+
+    self.d_model = d_model
+    self.vocab_size = vocab_size
+
+    self.weight_tying = weight_tying # Share weights btwn embedding and output matrix
+
+    if weight_tying and embedding_layer is not None:
+      # Using trnsposed embedding matrix
+      self.output_projection = None # No separate weights matrix needed
+      self.embedding_layer = embedding_layer
+      print(f"\nWill use E^T: [{d_model}, {vocab_size}] for output projection")
+
+    else:
+      # Independent output projection
+      self.output_projection = nn.Linear(d_model, vocab_size, bias=False)  # Separate weight matrix [d_model, vocab_size]
+      self.embedding_layer = None
+      print(f"\nCreated new Linear layer: [{d_model}] → [{vocab_size}]")
+      print(f"\nWeight matrix shape: {self.output_projection.weight.shape}\n")
+
+  def forward(self, x, temperature=1.0):
+    """
+    x: [batch, seq_len, d_model] or [batch, d_model]
+    Returns: logits [batch, seq_len, vocab_size] or [batch,vocab_size]
+             (matches input shape structure, regardless of weight tying)
+
+    """
+    print(f"\nLM Head Forward Pass")
+    print(f"Input x shape: {x.shape}")
+    print(f"Temperature: {temperature}\n")
+
+    if self.weight_tying and self.embedding_layer is not None:
+
+      # Using transposed embedding matrix E^T, it is the "unembedding" - projects back to vocabulary space
+      # [batch, seq, d_model] @ [d_model, vocab_size] = [batch, seq, vocab_size]
+      E  = self.embedding_layer.embedding.weight # [vacb_size, d_model]
+      print(f"\nUsing weight tying:")
+      print(f"\nEmbedding matrix E shape: {E.shape}")
+      print(f"\nE sample (first 3 tokens, first 5 dims):\n{E[:3, :5].detach().numpy().round(3)}")
+
+      print(f"\nOperation: x @ E^T")
+      print(f"\nx shape: {x.shape} @ E^T shape: [{E.shape[1]}, {E.shape[0]}]")
+
+      logits = F.linear(x,self.embedding_layer.embedding.weight) # F.linear(x, W) = x @ W^T
+
+      print(f"\nResult logits shape: {logits.shape}")
+
+      # Handle both 2D and 3D cases
+      if len(logits.shape) == 3:  # [batch, seq, vocab]
+        print(f"  Sample logits (first batch, first position, first 10 tokens):\n  {logits[0, 0, :10].detach().numpy().round(2)}")
+      else:  # [batch, vocab] - 2D case
+        print(f"  Sample logits (first batch, first 10 tokens):\n  {logits[0, :10].detach().numpy().round(2)}")
+
+
+
+    else:
+      print(f"\nUsing a separete output projection:")
+      print(f"\nWeight matrix shape: {self.output_projection.weight.shape}")
+      logits = self.output_projection(x)
+      print(f"\nResult logits shape: {logits.shape}")
+
+
+    # Apply temperature sampling
+
+    logits = logits/temperature # Scaling the logits.  Higher temp -> flatter distribution -> more random sampling
+
+    return logits
+
+
+  def get_probs(self,x,temperature=1.0):
+    """Get probabiility distribution over the vocab"""
+
+    logits = self.forward(x, temperature)
+    print(f"\n\nLogits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+
+    probs = F.softmax(logits, dim= -1) # applies softmax along last dim, the vocab dim
+
+    print(f"\nProbs shape: {probs.shape}")
+
+    # Handle both 2D and 3D cases
+    if len(probs.shape) == 3:  # [batch, seq, vocab]
+      print(f"\nProbs sum (should be 1.0): {probs[0, 0].sum().item():.6f}")
+    else:  # [batch, vocab] - 2D case
+      print(f"\nProbs sum (should be 1.0): {probs[0].sum().item():.6f}")
+
+
+    print(f"\nMax prob: {probs.max().item():.4f}, Min prob: {probs.min().item():.6f}\n\n")
+
+    return probs
+
+"""### Showing weight tying and temperature effect
+
+"""
+
+def demonstrate_weight_tying():
+  """Show weight tying between embedding and unembedding"""
+  vocab_size = 100
+  d_model = 32
+
+  # Create embedding layer
+  embedding = TokenEmbedding(vocab_size, d_model)  # E: [vocab_size, d_model] maps tokens → vectors
+
+  # LM head with weight tying
+  lm_head_tied = LanguageModelingHead(d_model, vocab_size,
+                                      weight_tying=True,  # Reuses embedding.weight^T
+                                      embedding_layer=embedding)
+
+  # LM head without weight tying
+  lm_head_separate = LanguageModelingHead(d_model, vocab_size,
+                                         weight_tying=False)  # Creates new weight matrix
+
+  # Count parameters
+  tied_params = sum(p.numel() for p in [embedding] + [lm_head_tied]
+                   for p in p.parameters())  # Only counts embedding weights once
+  separate_params = sum(p.numel() for p in [embedding] + [lm_head_separate]
+                       for p in p.parameters())  # Counts both embedding + output weights
+
+  print(f"\nParameter Count:")
+  print(f"  With tying: {tied_params:,} ({vocab_size}×{d_model})")
+  print(f"  Without: {separate_params:,} (2×{vocab_size}×{d_model})")
+  print(f"  Saved: {separate_params - tied_params:,} ({(separate_params - tied_params) / separate_params * 100:.0f}%)")
+
+  # Test forward pass
+  x = torch.randn(2, 10, d_model)  # [batch=2, seq=10, d_model=32]
+  logits_tied = lm_head_tied(x)  # [2, 10, 100] - logits for each position
+  logits_separate = lm_head_separate(x)
+  print(f"\nOutput shapes: {logits_tied.shape} (both)")  # [batch, seq, vocab_size]
+
+  # Visualize effect of temperature
+  temperatures = [0, 0.5, 1.0, 2.0]  # 0 = greedy/argmax, higher = more random
+  x_single = torch.randn(1, d_model)  # Single hidden state [batch=1, d_model=32]
+
+  print(f"\nTemperature Effects on Distribution:")
+  plt.figure(figsize=(16, 4))
+
+  for i, temp in enumerate(temperatures):
+    if temp == 0:  # Special case: greedy decoding
+      logits = lm_head_tied.forward(x_single, temperature=1.0)  # Get raw logits
+      probs = torch.zeros_like(logits)  # Zero probability everywhere
+      probs[0, logits.argmax()] = 1.0  # Probability 1 at argmax (deterministic)
+    else:
+      probs = lm_head_tied.get_probs(x_single, temperature=temp)  # softmax(logits/temp)
+
+    # Compute statistics
+    top5_probs, top5_indices = torch.topk(probs[0], 5)
+    entropy = -(probs * (probs + 1e-10).log()).sum().item()  # Shannon entropy H(p)
+
+    print(f"  T={temp:3.1f}: Top5={top5_indices[:3].detach().numpy()} "  # Show only top 3
+          f"P_max={probs.max().item():.3f} H={entropy:.2f}")
+
+    # Plot distribution
+    plt.subplot(1, 4, i+1)
+    plt.bar(range(vocab_size), probs[0].detach().numpy(), color='steelblue')
+    plt.title(f'T = {temp}' + (' (argmax)' if temp == 0 else ''))
+    plt.xlabel('Token ID')
+    plt.ylabel('P(token)')
+    plt.ylim(0, max(0.1, probs.max().item() * 1.1))
+
+    # Mark top token
+    max_idx = probs[0].argmax().item()
+    plt.axvline(x=max_idx, color='red', linestyle='--', alpha=0.5, linewidth=1)
+
+  plt.suptitle('Temperature Scaling: P(token) = softmax(logits/T)', fontsize=12)
+  plt.tight_layout()
+  plt.show()
+
+  print(f"\nMath:")
+  print(f"  T=0.0: argmax(logits) - deterministic selection")
+  print(f"  T=0.5: softmax(2×logits) - sharpened distribution")
+  print(f"  T=1.0: softmax(logits) - standard softmax")
+  print(f"  T=2.0: softmax(0.5×logits) - flattened distribution")
+
+demonstrate_weight_tying()
+
+"""#Language Modeling Head: Unembedding and Logit Lens Implementation"""
+
+class LogitLens:
+  """
+  Interpret intermediate transformer representationts
+  Reveals what tokens the model predicts at each layer by projecting the hiddn states through the unembedding matrix
+  Shows how predictions evolve from ealy layers to late layes.
+  """
+
+  def __init__(self,unembedding_matrix, vocab=None):
+    """
+    undembedding_matrix: [d_model, vocab_size] to projects to hidden states
+    vocab: optional vocab for decoding
+    """
+
+    self.unembedding = unembedding_matrix
+    self.vocab = vocab
+
+    print(f"LogitLens initialized with unembedding matrix: {unembedding_matrix.shape}")
+    print(f"  Sample W_U values: {unembedding_matrix[:2, :3].detach().numpy().round(3)}\n")  # First 2 dims, 3 vocab items
+
+  def decode_hidden_state(self, hidden_state, top_k=5):
+    """
+    Project hidden state to vocab and show top predictions
+    hidden_state: [d_model] or [batch, seq_len, d_model]
+
+    logits = h @ W_U where h ∈ ℝ^d_model, W_U ∈ ℝ^{d_model × vocab_size}
+    """
+
+    print(f"\n\nDecoding hidden state: {hidden_state.shape}")
+
+    # Ensure batched format for consistent processing
+    if hidden_state.dim()==1:
+      hidden_state = hidden_state.unsqueeze(0) # [d_model] → [1, d_model]
+      print(f"  Expanded to batch format: {hidden_state.shape}")
+
+    # Project to vocab space: [batch, *, d_model] @ [d_model, vocb_size] = [batch, * , vocab_size]
+    print(f"Computing: hidden @ W_U^T | {hidden_state.shape} @ [{self.unembedding.shape[0]}, {self.unembedding.shape[1]}]")
+    logits = hidden_state @ self.unembedding  # Direct matmul: [batch, d_model] @ [d_model, vocab_size]
+
+
+    # Convert logits to probs
+    probs = F.softmax(logits, dim=-1) # Normalize vocab dim
+    print(f"  Probs: {probs.shape}, sum={probs[0].sum():.6f} (should be 1.0)")
+
+    # Extract top-k most likely tokens
+    top_probs, top_indices = torch.topk(probs, k=top_k, dim=-1)
+    print(f"  Top-{top_k} tokens: {top_indices[0].detach().numpy()} with probs: {top_probs[0].detach().numpy().round(3)}\n")
+
+    return top_probs, top_indices
+
+
+  def analyze_layer_predictions(self, hidden_states_by_layer, position = -1):
+    """
+    Analyze the predictions at each layer for a specifc position
+    hidden_states_by_layer: list of [batch, deq_len, d_model]
+
+    Shows incremental refinement of the model, from randome guesses to confident predictions
+    """
+
+    n_layers = len(hidden_states_by_layer)
+    print(f"Analyzing {n_layers} layers at position {position}")
+
+    predictions_by_layer = []
+
+    for layer_idx, hidden in enumerate(hidden_states_by_layer):
+      layer_name = f"Embedding" if layer_idx == 0 else f"Layer {layer_idx}" if layer_idx < n_layers-1 else "Final"
+      print(f"\n{layer_name}:")
+
+      # Extract hidden state
+      if hidden.dim() == 3:
+        h = hidden[0, position] # First batch, specified position
+        print(f"  Extracted position {position}: {h.shape} from {hidden.shape}")
+
+      else:
+        h = hidden
+
+      # Analyze hidden state stats before projection
+      print(f"  Hidden stats: mean={h.mean():.3f}, std={h.std():.3f}, norm={h.norm():.3f}")
+
+      top_probs, top_indices = self.decode_hidden_state(h,top_k=5)
+      predictions_by_layer.append((top_probs[0], top_indices[0]))
+
+      # Show prediction confidence evolution
+      max_prob = top_probs[0][0].item()
+      entropy = -(top_probs[0] * (top_probs[0] + 1e-10).log()).sum().item() # H = -Σ p·log(p)
+      print(f"  Max confidence: {max_prob:.3f}, Entropy: {entropy:.3f}")
+
+    return(predictions_by_layer)
+
+"""### Demonstrate Logit Lens"""
+
+def demonstrate_logit_lens():
+  """Show predictions evolution through layers"""
+
+  class MiniTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads):
+      super().__init__()
+
+      self.embedding = TokenEmbedding(vocab_size, d_model)
+      self.pos_encoding = PositionalEncoding(d_model)
+      self.layers = nn.ModuleList([
+          TransformerBlock(d_model, n_heads) for _ in range(n_layers)
+      ])
+      self.ln_final = nn.LayerNorm(d_model) # final normalization before output
+
+    def forward(self, x, return_all_hidden=False):
+      print(f"\nMiniTransformer forward pass:")
+      print(f"  Input tokens: {x.shape}")
+
+      # Embedding
+      x = self.embedding(x)
+      print(f"  After embedding: {x.shape}, norm={x.norm():.2f}")
+
+      x = self.pos_encoding(x) # Add position info: x + PE(pos)
+      print(f"  After pos encoding: {x.shape}, norm={x.norm():.2f}")
+
+
+      # Forward pass through layers adding to Residual Stream
+      hidden_states = [x] # Intermediate representations
+      for i,layer in enumerate(self.layers):
+        x_before = x.clone()
+        x, _ = layer(x) # x_new = x_old + ΔLayer (residual connection inside)
+
+        # Measure change in the layer
+        delta = (x - x_before).norm() / x_before.norm()
+        print(f"  After layer {i+1}: norm={x.norm():.2f}, relative change={delta:.3f}")
+
+        hidden_states.append(x)
+
+      x = self.ln_final(x) # Layer Normalization before projection: (x - μ) / σ
+      print(f"  After final LN: norm={x.norm():.2f}")
+
+      hidden_states.append(x)
+
+      if return_all_hidden:
+        return( x, hidden_states)
+      else:
+        return(x)
+  # Initialize model with specific dimensions
+  vocab_size = 100  # Small vocabulary for demo
+  d_model = 64      # Hidden dimension
+  n_layers = 100      # Depth of network ## Tested on 10 and 100
+
+  print(f"\nModel configuration:")
+  print(f"  Vocab size: {vocab_size}")
+  print(f"  Model dim: {d_model}")
+  print(f"  Layers: {n_layers}")
+  print(f"  Parameters: {vocab_size * d_model} (embedding) + {n_layers * (4*d_model**2)} (approx layers)")
+
+  model = MiniTransformer(vocab_size, d_model, n_layers, n_heads=4)
+
+  # Get unembedding matrix: E^T projects back to vocab | [d_model, vocab_size]
+  unembedding = model.embedding.embedding.weight.T  # Transpose of embedding matrix
+  print(f"\nUnembedding matrix: {unembedding.shape} (E^T)")
+  print(f"  Frobenius norm: {unembedding.norm():.2f}")
+
+  # Create logit lens analyzer
+  logit_lens = LogitLens(unembedding)
+
+  # Process sample input - random tokens for demonstration
+  tokens = torch.randint(0, vocab_size, (1, 10))  # [batch=1, seq=10]
+  print(f"\nInput tokens: {tokens[0].numpy()}")
+
+  output, hidden_states = model(tokens, return_all_hidden=True)
+  print(f"\nCollected {len(hidden_states)} hidden states")
+
+  # Analyze predictions at each layer for last position
+  predictions = logit_lens.analyze_layer_predictions(hidden_states, position=-1)
+
+  # Visualize evolution of predictions through layers
+  fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+  # Plot 1: Top prediction probability by layer - shows confidence growth
+  layers = list(range(len(predictions)))
+  top_probs = [pred[0][0].item() for pred in predictions]  # Extract max probability
+  top_tokens = [pred[1][0].item() for pred in predictions]  # Extract predicted token
+
+  print(f"\n{'='*50}")
+  print("CONFIDENCE EVOLUTION:")
+  for i, (prob, token) in enumerate(zip(top_probs, top_tokens)):
+    layer_name = f"Layer {i}" if 0 < i < len(predictions)-1 else ("Embedding" if i == 0 else "Final")
+    print(f"  {layer_name:10}: Token {token:3d} (p={prob:.3f})")
+
+  axes[0].plot(layers, top_probs, marker='o', linewidth=2)
+  axes[0].set_xlabel('Layer')
+  axes[0].set_ylabel('Top Token Probability')
+  axes[0].set_title('Confidence Evolution Through Layers')
+  axes[0].grid(True, alpha=0.3)
+
+  # Annotate key transitions
+  if len(top_probs) > 1:
+    max_jump = np.diff(top_probs).argmax()
+    y_range = max(top_probs) - min(top_probs)
+    axes[0].annotate(f'Biggest jump\nΔp={top_probs[max_jump+1]-top_probs[max_jump]:.3f}',
+                    xy=(max_jump+1, top_probs[max_jump+1]),
+                    xytext=(max_jump+0.5, top_probs[max_jump+1] + y_range*0.1),
+                    arrowprops=dict(arrowstyle='->', color='red', alpha=0.5))
+
+  # Plot 2: Top-5 predictions at each layer - shows distribution changes
+  for layer_idx, (probs, indices) in enumerate(predictions):
+    y_positions = [layer_idx] * 5
+    x_positions = probs.detach().numpy()
+    colors = plt.cm.viridis(np.linspace(0, 1, 5))
+
+    for i in range(5):
+      axes[1].barh(layer_idx + i*0.15 - 0.3, x_positions[i],
+                  height=0.15, color=colors[i], alpha=0.7)
+
+  axes[1].set_ylabel('Layer')
+  axes[1].set_xlabel('Probability')
+  axes[1].set_title('Top-5 Token Probabilities by Layer')
+  axes[1].set_ylim(-0.5, len(predictions) - 0.5)
+
+  plt.tight_layout()
+  plt.show()
+
+  # Compute and display entropy evolution - measures prediction uncertainty
+  print(f"\n{'='*50}")
+  print("ENTROPY ANALYSIS (uncertainty measure):")
+  for i, (probs, indices) in enumerate(predictions):
+    # Shannon entropy: H = -Σ p·log(p) - higher means more uncertain
+    entropy = -(probs * (probs + 1e-10).log()).sum().item()
+    layer_name = f"Layer {i}" if 0 < i < len(predictions)-1 else ("Embedding" if i == 0 else "Final")
+    print(f"  {layer_name:10}: H={entropy:.3f} {'(high uncertainty)' if entropy > 1.5 else '(low uncertainty)' if entropy < 0.5 else ''}")
+
+  print("\nEarly layers: High entropy, uniform predictions (model unsure)")
+  print("\nMiddle layers: Rapid refinement, confidence grows")
+  print("\nLate layers: Low entropy, peaked distribution (model confident)")
+  print("\nResidual stream accumulates information: h_final = h_0 + Σ ΔLayer_i")
+
+demonstrate_logit_lens()
+
+print("The Model should be Trained on actual data in order to see the LogLens evolve")
+
+print(""" With 10 Layers:
+LogitLens on this untrained transformer shows near-uniform probability distributions
+across all layers with randomly changing token predictions - a stark contrast to
+trained models where early layers show high-entropy uncertainty that progressively
+refines into confident, low-entropy predictions in later layers. Here, random
+weights produce only noise rather than the incremental understanding that emerges
+through the residual stream in trained transformers.
+""")
+
+
+print("""With 100 Layers:
+LogitLens on this untrained transformer reveals emergent structure from random weights:
+early layers show unstable token predictions that converge to a dominant token (55)
+for 35+ consecutive layers, with confidence peaking mid-network before collapsing back
+to near-uniform at the output. Unlike trained models where entropy decreases as
+understanding builds, here entropy rises then falls - reflecting mathematical artifacts
+from compounding random transformations rather than meaningful information refinement.
+These patterns (stable attractors, oscillating confidence) demonstrate how deep random
+networks create statistical regularities that superficially mimic but fundamentally
+differ from the incremental understanding in trained transformers.
+""")
 
