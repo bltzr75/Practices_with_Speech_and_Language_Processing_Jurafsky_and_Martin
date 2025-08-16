@@ -2418,3 +2418,221 @@ def test_transformer_lm():
 
 model = test_transformer_lm()
 
+"""# Simple Tokenizer for Training Demo"""
+
+class SimpleTokenizer:
+  """
+  Basic character-level tokenizer
+    Maps characters to indices: 'a' -> 97 (ASCII)
+  Character-level = finest granularity, no OOV but long sequences
+  """
+
+
+  def __init__(self, vocab_size=256):
+    self.vocab_size = vocab_size
+
+    # Bidirectional mappings for encode/decode
+    self.char_to_id = { chr(i): i   for i in range(vocab_size)} # 'A' -> 65
+    self.id_to_char = { i : chr(i)  for i in range(vocab_size)} # 65 -> 'A'
+
+  def __call__(self, text):
+    return([self.char_to_id.get(c,0) for c in text ])
+
+  def decode(self, ids):
+    return( ''.join([self.id_to_char.get(id, '') for id in ids ])  )
+
+# tokenizer = SimpleTokenizer()
+# tokenizer("Here Ari testing the tokenizer")
+
+"""#Training Setup"""
+
+class TextDataset(Dataset):
+  """Simple text dataset for LM"""
+
+  def __init__(self, texts, tokenizer, max_length=128):
+    self.tokenizer = tokenizer
+    self.max_length = max_length
+    self.texts = texts
+
+    print(f"\nTextDataset initialized:")
+    print(f"  Texts: {len(texts)} samples")
+    print(f"  Max length: {max_length} tokens")
+    print(f"  Sample text: '{texts[0][:50]}...'\n")
+
+  def __len__(self):
+    return(len(self.texts))
+
+
+  def __getitem__(self,idx):
+    text = self.texts[idx]
+    tokens = self.tokenizer(text)[:self.max_length]
+
+    # Pad if necessary
+    if len(tokens) < self.max_length:
+      tokens = tokens + [0] * (self.max_length - len(tokens)) # Right Padding with 0 (typically reserved for <PAD> token)
+
+    tokens = torch.tensor(tokens, dtype=torch.long)
+
+
+    # For language modeling, target is input shifted by 1
+    # Autoregressive setup: predict next token from current
+
+    input_ids = tokens[:-1]  # All except last:  [x₀, x₁, x₂, ..., x_{n-1}]
+
+    targets = tokens[1:]     # All except first: [    x₁, x₂, x₃,   ...,   x_n]
+
+
+
+    if idx == 0:  # Show alignment once
+      print(f"Autoregressive alignment (first 5 tokens):")
+      print(f"  Input:  {input_ids[:5].tolist()} -> predict")
+      print(f"  Target: {targets[:5].tolist()}\n")
+
+    return input_ids, targets
+
+def setup_training():
+  """Seup training components"""
+
+  # Create simple dataset: 4 sentences repeated for sufficient data
+  texts = [
+    "The quick brown fox jumps over the lazy dog.",      # Pangram: contains all letters
+    "Machine learning is fascinating and powerful.",      # Technical content
+    "Transformers have revolutionized NLP.",             # Domain-specific
+    "Attention is all you need for state-of-the-art results.",  # Paper reference
+  ] * 25  # Repeat 25x -> 100 samples total
+
+  print(f"\nDataset statistics:")
+  print(f"  Unique texts: 4")
+  print(f"  Total samples: {len(texts)}")
+  print(f"  Total characters: {sum(len(t) for t in texts):,}")
+  print(f"  Avg length: {sum(len(t) for t in texts) / len(texts):.1f} chars\n")
+
+  tokenizer = SimpleTokenizer()
+  dataset = TextDataset(texts, tokenizer, max_length=50)
+
+  # DataLoader: handles batching, shuffling, parallel loading
+  # batch_size=4: process 4 sequences simultaneously (efficiency vs memory)
+  dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+
+  print(f"DataLoader configuration:")
+  print(f"  Batch size: 4")
+  print(f"  Batches per epoch: {len(dataloader)}")
+  print(f"  Shuffle: True (randomize order each epoch)\n")
+
+
+  # Small Transformer
+  model = TransformerLM(
+    vocab_size=256,  # Full ASCII range
+    d_model=128,     # Hidden dimension (small for demo)
+    n_layers=2,      # Shallow network (GPT-3 has 96)
+    n_heads=4,       # 4 attention heads (d_head = 128/4 = 32)
+    d_ff=256,        # FFN dimension (typically 4*d_model)
+    dropout=0.1      # 10% dropout for regularization
+  ).to(device)
+
+  total_params = sum(p.numel() for p in model.parameters())
+  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+  print(f"Model architecture:")
+  print(f"  Total parameters: {total_params:,}")
+  print(f"  Trainable parameters: {trainable_params:,}")
+  print(f"  Memory (float32): {total_params * 4 / 1024**2:.2f} MB\n") #Estimate model memory: total_params x 4 bytes (float32) -> convert to MB (/1024**2)
+
+  # Optimizer: AdamW (Adam with decoupled weight decay)
+  # Adam: adaptive learning rates per parameter based on moment estimates
+  # Weight decay: L2 regularization, but applied directly (not via gradients)
+  optimizer = optim.AdamW(
+      model.parameters(),
+      lr=1e-3, # 0.001
+      weight_decay=0.01 # L2 penalty: ||w||**2 regularization, shrinks weights but does not eliminate them (like L1 does)
+      )
+  print(f"Optimizer (AdamW):")
+  print(f"  Learning rate: 1e-3")
+  print(f"  Weight decay: 0.01 (L2 regularization)")
+  print(f"  Betas: (0.9, 0.999) (momentum parameters)")
+  print(f"  Eps: 1e-08 (numerical stability)\n")
+
+
+  # Learning rate scheduler: cosine annealing with linear warmup
+  # Warmup: gradually increase lr from 0 to initial_lr (stability)
+  # Cosine: smoothly decrease lr following cosine curve (better convergence)
+  def get_lr_scheduler(optimizer, num_warmup_steps, num_training_steps):
+    """
+    Creates schedule: linear warmup then cosine decay
+
+    lr(t) = t/warmup * lr_init                if t < warmup
+    lr(t) = lr_init * 0.5 * (1 + cos(π*progress))  if t >= warmup
+    where progress = (t - warmup) / (total - warmup)
+    """
+
+    def lr_lambda(current_step):
+      #Warmup phase: linearincreasing from 0 to 1
+      if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+
+      # Cosine annealing phase: cosine decrease from 1 to 0
+      progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps)) # remaining warmup steps divided by defined cos annealing decay steps
+      return (max(0.0, 0,5 * (1.0 + math.cos(math.pi * progress))))
+
+    return( torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda))
+
+  num_epochs = 10
+  steps_per_epoch = len(dataloader) # batches per epoch
+  total_steps = num_epochs * steps_per_epoch
+  warmup_steps = total_steps // 10   # 10% warmup,  90% cosine annealing decay
+
+  scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps)
+
+  print(f"Training schedule:")
+  print(f"  Epochs: {num_epochs}")
+  print(f"  Steps per epoch: {steps_per_epoch}")
+  print(f"  Total steps: {total_steps}")
+  print(f"  Warmup steps: {warmup_steps} ({warmup_steps/total_steps*100:.0f}% of training)")
+
+
+  # Show learning rate schedule
+  print(f"\nLearning rate schedule samples:")
+  test_steps = [0, warmup_steps//2, warmup_steps, total_steps//2, total_steps-1]
+  for step in test_steps:
+    scheduler.last_epoch = step - 1  # LambdaLR uses last_epoch
+    lr = scheduler.get_last_lr()[0] * 1e-3  # Multiply by base lr
+    phase = "warmup" if step < warmup_steps else "cosine"
+    print(f"  Step {step:3d}: lr={lr:.6f} ({phase})")
+  scheduler.last_epoch = -1  # Reset
+
+  print(f"\nTraining ready to begin!")
+  print(f"  Device: {device}")
+  print(f"  Mixed precision: {'Enabled' if torch.cuda.is_available() else 'Disabled'}")
+  print(f"  Gradient accumulation: Not configured (batch_size=4 sufficient)\n")
+
+  return( model, optimizer, scheduler, dataloader, tokenizer)
+
+# Initialize training components
+model, optimizer, scheduler, dataloader, tokenizer = setup_training()
+
+"""### Show sample batch"""
+
+print("\nSample batch inspection:")
+for i, (input_ids, targets) in enumerate(dataloader):
+  if i == 0:  # First batch only
+    print(f"  Input shape: {input_ids.shape}")  # [batch=4, seq_len=49]
+    print(f"  Target shape: {targets.shape}")   # [batch=4, seq_len=49]
+
+    # Decode first sequence to show data
+    sample_input = input_ids[0]
+    sample_target = targets[0]
+
+    # Find actual text length (before padding)
+    non_pad = (sample_input != 0).sum() # counts all non 0
+
+    print(f"\nFirst sequence (length={non_pad}):")
+    print(f"  Input text:  '{tokenizer.decode(sample_input[:20].tolist())}...'")
+    print(f"  Target text: '{tokenizer.decode(sample_target[:20].tolist())}...'")
+    print(f"  Input tokens:  {sample_input[:10].tolist()}")
+    print(f"  Target tokens: {sample_target[:10].tolist()}")
+    print(f"  Shift check: input[1:] == target[:-1]? {torch.all(sample_input[1:] == sample_target[:-1])}")
+    break
+
+"""#Training Loop with Modern Features"""
+
