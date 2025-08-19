@@ -513,7 +513,7 @@ class MultiHeadAttention(nn.Module):
     # Apply mask
     if mask is not None:
        mask = mask.unsqueeze(0).unsqueeze(1) # [L,L] -> [1,L,L] broadcasting for heads dimension
-       scores = scores.masked_fill(mask == 0, -1e9)
+       scores = scores.masked_fill(mask == 0, -1e4)  # FP16 safe: -10000 < 65504
 
     # Softmax
     attn_weights = F.softmax(scores,dim=-1)
@@ -1727,7 +1727,7 @@ class LanguageModelingHead(nn.Module):
       E  = self.embedding_layer.embedding.weight # [vacb_size, d_model]
       print(f"\nUsing weight tying:")
       print(f"\nEmbedding matrix E shape: {E.shape}")
-      print(f"\nE sample (first 3 tokens, first 5 dims):\n{E[:3, :5].detach().numpy().round(3)}")
+      print(f"\nE sample (first 3 tokens, first 5 dims):\n{E[:3, :5].detach().cpu().numpy().round(3)}")
 
       print(f"\nOperation: x @ E^T")
       print(f"\nx shape: {x.shape} @ E^T shape: [{E.shape[1]}, {E.shape[0]}]")
@@ -1738,7 +1738,7 @@ class LanguageModelingHead(nn.Module):
 
       # Handle both 2D and 3D cases
       if len(logits.shape) == 3:  # [batch, seq, vocab]
-        print(f"  Sample logits (first batch, first position, first 10 tokens):\n  {logits[0, 0, :10].detach().numpy().round(2)}")
+        print(f"  Sample logits (first batch, first position, first 10 tokens):\n  {logits[0, 0, :10].detach().cpu().numpy().round(2)}")
       else:  # [batch, vocab] - 2D case
         print(f"  Sample logits (first batch, first 10 tokens):\n  {logits[0, :10].detach().numpy().round(2)}")
 
@@ -2573,7 +2573,8 @@ def setup_training():
 
       # Cosine annealing phase: cosine decrease from 1 to 0
       progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps)) # remaining warmup steps divided by defined cos annealing decay steps
-      return (max(0.0, 0,5 * (1.0 + math.cos(math.pi * progress))))
+      return(max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress))))
+
 
     return( torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda))
 
@@ -2635,4 +2636,291 @@ for i, (input_ids, targets) in enumerate(dataloader):
     break
 
 """#Training Loop with Modern Features"""
+
+def training_with_modern_features(model, optimizer, scheduler, dataloader, num_epochs=10, gradient_accumulation_steps=4):
+  """
+  Training loop with gradient accumulation and mixed precision
+
+  Gradient Accumulation: simulate larger batch sizes by accumulating gradients over multiple forward passes before actually updating the weights
+  Effective batch = batch_size * gradient_accumulation_steps
+
+
+  Mixed Precision: Using float16 for forward pass which is faster, then float32 for the gradients calculations (more stable)
+  Prevents underflow via gradient scaling: multiply loss by a scale before the backward pass
+
+  Forward and backward compute run in FP16 (inside autocast), but the gradients are scaled and then stored/applied in FP32 (via the master weights). Weights update: always in FP32 (master weights)
+
+  Searches/checks for inf/NaN and if not it will increase the scale for more stability, if it detects any inf/NaN scale is halved
+
+   """
+
+  print(f"\nTraining configuration:")
+  print(f"  Epochs: {num_epochs}")
+  print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+  print(f"  Effective batch size: {4 * gradient_accumulation_steps}")  # 4 from dataloader
+  print(f"  Updates per epoch: {len(dataloader) // gradient_accumulation_steps}\n")
+
+  # Mixed precision setup: FP16 compute with FP32 master weights
+  # GradScaler preventing gradient underflow in FP16 by scaling the loss before the backward pass
+  scaler = GradScaler() if torch.cuda.is_available() else None
+
+  if scaler is not None:
+    print(f"Mixed precision training enabled (AMP)")
+    print(f"  Initial scale: {scaler.get_scale()}")
+    print(f"  Growth factor: 2.0 (doubles scale if no inf/nan)")
+    print(f"  Backoff factor: 0.5 (halves scale if inf/nan detected)\n")
+  else:
+    print(f"Mixed precision disabled (CPU mode)\n")
+
+  # Tracking metrics
+  losses = []
+  learning_rates = []
+  gradient_norms = [] # record the L2 norm of gradients after each update
+
+  model.train() # Enabling dropout.Also Batch norm training mode. uses mini-batch statistics (mean/variance of the current batch) to normalize activations.
+  global_step = 0
+
+  for epoch in range(num_epochs):
+    epoch_loss = 0
+    num_batches = 0
+    accumulation_loss = 0 # Track loss
+
+    print(f"\nEpoch {epoch+1}/{num_epochs}")
+    print(f"  Learning rate: {scheduler.get_last_lr()[0]:.6f}")
+
+    for batch_idx, (input_ids, targets) in enumerate(dataloader):
+      # Move to device
+      input_ids = input_ids.to(device) # [batch, seq_len]
+      targets = targets.to(device)     # [batch, seq_len]
+
+
+      if batch_idx == 0:
+        print(f"  Batch shape: {input_ids.shape}")
+        print(f"  Tokens range: [{input_ids.min()}, {input_ids.max()}]\n")
+
+      # Mixed precision forward pass: FP16 for the pass and for the grads FP32
+      if scaler is not None:
+        # autocast: automatically uses FP16 where safe, and FP32 where needed
+
+        with autocast():
+          logits, loss = model(input_ids, targets) # FP16
+
+          # Scale loss for grad accumulation
+          # Loss for each mini-batch should be divided by the accumulation steps
+          # Maintains correct gradient magnitudes
+          loss = loss / gradient_accumulation_steps # Average over accumulation, same value over all the training
+
+          if batch_idx % 10 == 0:
+            print(f"  Step {batch_idx}: logits {logits.shape}, dtype={logits.dtype}")
+            print(f"    Raw loss: {loss.item() * gradient_accumulation_steps:.4f}")
+            print(f"    Scaled loss: {loss.item():.4f}")
+
+        # Backward pass with the gradient scaling
+        # scaling gradients up to prevent FP16 underflow: d(scale * loss)/dw = scale*dloss/dw
+        scaler.scale(loss).backward() # accumulate scaled gradients
+        accumulation_loss +=loss.item()
+
+      else:
+        # Standard FP32 training
+        logits, loss = model(input_ids, targets)
+        loss = loss / gradient_accumulation_steps
+        loss.backward() # grad*= d(loss)/dw
+        accumulation_loss += loss.item()
+
+      # Gradient accumulation: update weights every N steps
+      # Simulates batch_size = actual_batch * accumulation_steps
+      # This simulates training with a bigger batch without needing more GPU memory
+      # Large batches often improve training stability and allow higher learning rates. But GPUs may not fit big batches. Accumulating gradients over several small micro-batches achieves the same effect as one big batch.
+      if (batch_idx + 1) % gradient_accumulation_steps == 0:
+        if batch_idx < 20:
+          print(f"\n  Accumulated {gradient_accumulation_steps} steps, updating weights...")
+          print(f"    Accumulated loss: {accumulation_loss * gradient_accumulation_steps:.4f}")
+
+        # gradient clipping: prevents inestability and expoding gradients
+        # rescales gradients if || g || > max_norm, example: if ||g|| > 1.0: g = g * (1.0 / ||g||) ( Scale down to max norm = 1.0)
+        if scaler is not None:
+          scaler.unscale_(optimizer) # Unscale gradients to FP32 for clipping, bcs FP16 lacks precision for gradients, has tiny values that underflow to zero in fp16 (e.g., 1e-8)
+
+        # Compute gradient norm before clipping
+        total_norm = 0
+        for p in model.parameters():
+          if p.grad is not None:
+            total_norm += p.grad.data.norm(2).item()**2 #  L2 "Ridge" regul. norm of param's gradient  √(Σ g²), converted to python float, squared and accumulated
+
+        total_norm = total_norm ** 0.5 # sqrt of final norm
+
+        # Clip gradients: g = g * min(1, max_norm/||g||)
+        #clip_grad_norm_ rescales gradients if their total norm exceeds max_norm
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Compute gradient norm after clipping
+        clipped_norm = 0
+        for p in model.parameters():
+          if p.grad is not None:
+             clipped_norm += p.grad.data.norm(2).item() ** 2 # Ridge of gradient squared
+        clipped_norm = clipped_norm ** 0.5 # sqrt
+
+        if batch_idx < 20:
+          print(f"    Gradient norm: {total_norm:.3f} -> {clipped_norm:.3f} (clipped)")
+
+        gradient_norms.append(clipped_norm)
+
+
+        # weight update, optimizer step: w = w - lr * grad
+        if scaler is not None:
+          scaler.step(optimizer) # Unscales and updates wihts
+          scaler.update() # adjusts scale for nxt iteration
+
+          if batch_idx < 10:
+            print(f"    New scale: {scaler.get_scale()}")
+
+        else:
+          optimizer.step() # standard weight update: w -= lr*grad
+
+
+        # update learning rate with the scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Clear grads for next accumulation
+        optimizer.zero_grad()
+
+        global_step += 1
+
+        # Track metrics
+        losses.append(accumulation_loss * gradient_accumulation_steps ) # Actual loss
+        learning_rates.append(current_lr)
+
+        if global_step % 10 == 0:
+          print(f"  Global step {global_step}: loss={losses[-1]:.4f}, lr={current_lr:.6f}")
+
+
+        accumulation_loss = 0 # Reset for next accum
+
+
+      epoch_loss += loss.item() * gradient_accumulation_steps
+      num_batches += 1
+
+
+      # Logging
+      if batch_idx % 10 == 0 and batch_idx > 0 :
+        current_loss = loss.item() * gradient_accumulation_steps
+        current_lr = scheduler.get_last_lr()[0]
+        perplexity = torch.exp(torch.tensor(current_loss))
+
+        print(f"  Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(dataloader)}")
+        print(f"    Loss: {current_loss:.4f} (perplexity: {perplexity:.2f})")
+        print(f"    LR: {current_lr:.6f}")
+        print(f"    Grad norm: {gradient_norms[-1] if gradient_norms else 0:.3f}")
+
+
+    # Epoch summary
+    avg_loss = epoch_loss / num_batches
+    avg_perplexity = torch.exp(torch.tensor(avg_loss))
+    print(f"\nEpoch {epoch+1} completed:")
+    print(f"  Average loss: {avg_loss:.4f}")
+    print(f"  Average perplexity: {avg_perplexity:.2f}")
+    print(f"  Final LR: {scheduler.get_last_lr()[0]:.6f}")
+    print(f"  Steps completed: {global_step}")
+
+  print(f"\nTraining completed!")
+  print(f"  Total steps: {global_step}")
+  print(f"  Final loss: {losses[-1]:.4f}")
+  print(f"  Loss reduction: {losses[0]:.4f} -> {losses[-1]:.4f} ({(losses[0]-losses[-1])/losses[0]*100:.1f}%)")
+
+
+  # Plot training curves
+  fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+  # Loss curve
+  axes[0, 0].plot(losses, linewidth=2, alpha=0.8)
+  axes[0, 0].set_xlabel('Step')
+  axes[0, 0].set_ylabel('Loss')
+  axes[0, 0].set_title(f'Training Loss (final={losses[-1]:.3f})')
+  axes[0, 0].grid(True, alpha=0.3)
+
+  # Learning rate schedule
+  axes[0, 1].plot(learning_rates, linewidth=2, color='orange', alpha=0.8)
+  axes[0, 1].set_xlabel('Step')
+  axes[0, 1].set_ylabel('Learning Rate')
+  axes[0, 1].set_title('Learning Rate Schedule (Cosine w/ Warmup)')
+  axes[0, 1].grid(True, alpha=0.3)
+
+  # Add warmup region shading
+  warmup_end = len(learning_rates) * 0.1  # 10% warmup
+  axes[0, 1].axvspan(0, warmup_end, alpha=0.2, color='blue', label='Warmup')
+  axes[0, 1].legend()
+
+  # Gradient norms
+  if gradient_norms:
+    axes[1, 0].plot(gradient_norms, linewidth=1, color='green', alpha=0.7)
+    axes[1, 0].set_xlabel('Update Step')
+    axes[1, 0].set_ylabel('Gradient Norm')
+    axes[1, 0].set_title('Gradient Norm (after clipping)')
+    axes[1, 0].axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='Clip threshold')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
+
+  # Perplexity
+  perplexities = [torch.exp(torch.tensor(l)).item() for l in losses]
+  axes[1, 1].plot(perplexities, linewidth=2, color='purple', alpha=0.8)
+  axes[1, 1].set_xlabel('Step')
+  axes[1, 1].set_ylabel('Perplexity')
+  axes[1, 1].set_title(f'Perplexity (final={perplexities[-1]:.1f})')
+  axes[1, 1].grid(True, alpha=0.3)
+  axes[1, 1].set_yscale('log')  # Log scale for perplexity
+
+  plt.suptitle(f'Training Metrics - {num_epochs} Epochs', fontsize=14)
+  plt.tight_layout()
+  plt.show()
+
+
+  print("1. LOSS CURVE: Sharp initial drop = model rapidly learning patterns. Smooth descent = optimizer working well (AdamW momentum + gradient accumulation). Plateaus indicate memorization vs generalization boundary. Oscillations suggest batch variance or learning rate too high.")
+
+  print("2. LR SCHEDULE: Warmup phase (blue) prevents chaotic early updates when gradients are unstable. Peak after warmup = maximum learning. Cosine decay formula: lr(t) = 0.5 * lr_max * (1 + cos(π*t/T)) enables fine-tuning. End spikes are scheduler artifacts (ignore).")
+
+  print("3. GRADIENT NORMS: Healthy range: 0.5-1.0 never exceeding clip threshold. Below 0.5 = vanishing gradients (dying network). At 1.0 (red line) = clipping active: g = g * min(1, max_norm/||g||). Spikes = difficult loss regions (sharp curvature). Consistent magnitude = good backward flow through layers.")
+
+  print("4. PERPLEXITY (e^loss): Measures prediction uncertainty. Perfect=1.0 (100% confident), Good LM=20-50, Confused=>1000. Log scale shows exponential improvement. High final value = needs more diverse data. Low (<10) on small dataset = overfitting/memorization.")
+
+
+
+  # Print gradient statistics
+  if gradient_norms:
+    print(f"\nGradient norm statistics:")
+    print(f"  Mean: {np.mean(gradient_norms):.3f}")
+    print(f"  Std: {np.std(gradient_norms):.3f}")
+    print(f"  Max: {np.max(gradient_norms):.3f}")
+    print(f"  Clipped: {sum(g > 0.99 for g in gradient_norms)}/{len(gradient_norms)} steps")
+
+  return losses
+
+"""## Train Model"""
+
+print("\nStarting training with modern features...")
+print(f"Device: {device}")
+print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+# Check initial model predictions (untrained)
+print(f"\nInitial model check (untrained):")
+with torch.no_grad():
+  sample_input = torch.randint(0, 256, (1, 10)).to(device)
+  sample_logits, _ = model(sample_input)
+  sample_probs = F.softmax(sample_logits[0, -1], dim=-1)
+  top5_probs, top5_idx = torch.topk(sample_probs, 5)
+  print(f"  Top-5 predictions: {top5_idx.tolist()}")
+  print(f"  Top-5 probs: {top5_probs.tolist()}")
+  print(f"  Entropy: {-(sample_probs * (sample_probs + 1e-10).log()).sum():.3f} (high = random)")
+
+losses = training_with_modern_features(model, optimizer, scheduler, dataloader, num_epochs=5)
+
+# Check model after training
+print(f"\nPost-training model check:")
+with torch.no_grad():
+  sample_logits, _ = model(sample_input)
+  sample_probs = F.softmax(sample_logits[0, -1], dim=-1)
+  top5_probs, top5_idx = torch.topk(sample_probs, 5)
+  print(f"  Top-5 predictions: {top5_idx.tolist()}")
+  print(f"  Top-5 probs: {top5_probs.tolist()}")
+  print(f"  Entropy: {-(sample_probs * (sample_probs + 1e-10).log()).sum():.3f} (low = confident)")
 
