@@ -39,7 +39,8 @@ from torch.cuda.amp import autocast, GradScaler
 
 from functools import partial # Creates partial functions by fixing some arguments. Useful for creating customized functions from general ones
 
-
+import urllib.request
+from PIL import Image
 
 
 np.random.seed(42)
@@ -2644,13 +2645,14 @@ def training_with_modern_features(model, optimizer, scheduler, dataloader, num_e
   Gradient Accumulation: simulate larger batch sizes by accumulating gradients over multiple forward passes before actually updating the weights
   Effective batch = batch_size * gradient_accumulation_steps
 
+  Gradient Clipping: prevents exploding gradients by rescaling
 
-  Mixed Precision: Using float16 for forward pass which is faster, then float32 for the gradients calculations (more stable)
+  Mixed Precision (AMP): Using float16 for forward pass which is faster, then float32 for the gradients calculations (more stable)
   Prevents underflow via gradient scaling: multiply loss by a scale before the backward pass
-
   Forward and backward compute run in FP16 (inside autocast), but the gradients are scaled and then stored/applied in FP32 (via the master weights). Weights update: always in FP32 (master weights)
-
   Searches/checks for inf/NaN and if not it will increase the scale for more stability, if it detects any inf/NaN scale is halved
+
+  Learning Rate Scheduling: Warmup and Cosine annealing
 
    """
 
@@ -2923,4 +2925,299 @@ with torch.no_grad():
   print(f"  Top-5 predictions: {top5_idx.tolist()}")
   print(f"  Top-5 probs: {top5_probs.tolist()}")
   print(f"  Entropy: {-(sample_probs * (sample_probs + 1e-10).log()).sum():.3f} (low = confident)")
+
+"""#Flash Attention
+
+Flash Attention is an attention algorithm used to reduce this problem and scale transformer-based models more efficiently, enabling faster training and inference.
+
+Standard attention mechanism uses High Bandwidth Memory (HBM) to store, read and write keys, queries and values. HBM is large in memory, but slow in processing, meanwhile SRAM is smaller in memory, but faster in operations. In the standard attention implementation, the cost of loading and writing keys, queries, and values from HBM is high. It loads keys, queries, and values from HBM to GPU on-chip SRAM, performs a single step of the attention mechanism, writes it back to HBM, and repeats this for every single attention step.
+
+
+**Instead, Flash Attention loads keys, queries, and values once, fuses the operations of the attention mechanism, and writes them back.**
+
+[Hugging Face](https://huggingface.co/docs/text-generation-inference/en/conceptual/flash_attention)
+
+"""
+
+image_url = 'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/tgi/flash-attn.png'
+file_name = "downloaded_image.jpg"
+urllib.request.urlretrieve(image_url, file_name)
+image = Image.open(file_name)
+image
+
+def flash_attention_forward(Q,K,V, mask=None, dropout_p=0.0):
+  """
+  Flash Attention with PyTorch's scaled_dot_product_attention
+  O(N²) memory -> O(N) via tiling and recomputation
+
+  Instead of materializing N×N attention matrix, compute attention in blocks and accumulate results
+  """
+
+  # Check pytorch version
+  torch_version = torch.__version__
+  if torch_version < "2.0":
+    print(f"\nFlash Attention requires PyTorch 2.0+, current: {torch_version}")
+
+    # starndard attention: Q @ K^T / √d_k -> softmax -> @ V
+    scale = 1.0 / math.sqrt(Q.size(-1)) # 1/√d_k for variance stability
+
+    print(f"Q: {Q.shape}, K^T: {K.transpose(-2,-1).shape}")  # [B,h,L,d] @ [B,h,d,L]
+    scores = torch.matmul(Q,K.transpose(-2,-1)) * scale   # [B,h,L,L] attention matrix
+    print(f"Scores: {scores.shape}, range: [{scores.min():.2f}, {scores.max():.2f}]")
+
+
+    if mask is not None:
+      scores = scores.masked_fill(mask == 0, -1e9)
+      print(f"Masked scores: {(scores > -1e8).float().mean():.2%} visible")
+
+    attn_weights = F.softmax(scores, dim=-1) # Normalize over keys
+    print(f"Attention weights: {attn_weights.shape}, sparsity: {(attn_weights < 0.01).float().mean():.2%}")
+
+    if dropout_p > 0:
+      attn_weights = F.dropout(attn_weights, p=dropout_p)
+
+    output = torch.matmul(attn_weights, V) # [B,h,L,L] @ [B,h,L,d] = [B,h,L,d]
+    print(f"Output: {output.shape}, norm: {output.norm(dim=-1).mean():.3f}")
+
+    return( output, attn_weights)
+
+
+  # Flash Attention: memory-efficient attention via kernel fusion
+  print(f"\nUsing Flash Attention (PyTorch {torch_version})")
+  print(f"Memory: O(N) instead of O(N²) for sequence length N \n")
+
+  with torch.backends.cuda.sdp_kernel(
+    enable_flash = True,          # Using Flash Attention kernel
+    enable_math  = False,         # Disabling fallback to standard math
+    enable_mem_efficient = False  # Disabling memory-efficient attention
+  ):
+    # Fused kernel: no intermediate NxN matrix = no quadratic complexity
+    output = F.scaled_dot_product_attention(
+        Q,K,V,
+        attn_mask = mask,
+        dropout_p = dropout_p if torch.is_grad_enabled() else 0.0,
+        is_causal = True if mask is None else False # Build-in causal masking
+    )
+    print(f"\nFlash output: {output.shape}, computed without materializing {Q.shape[2]}×{Q.shape[2]} matrix")
+  return(output, None) # Flash attention does not return weights
+
+class FlashMultiHeadAttention(nn.Module):
+  """
+  Multi-head attention using Flash Attention
+
+  Flash Attention algorithm (Dao et al 2022)
+  -Tiles Q,K,V into blocks that fit th SRAM
+  - Computes attention block-by-block
+  - Accumulates results without storing full attention matrix
+  """
+
+  def __init__(self, d_model, n_heads, dropout=0.1):
+    super(FlashMultiHeadAttention, self).__init__()
+
+    assert d_model % n_heads == 0 # Each head gets d_model (embedding dim) /n_heads dims (num of heads)
+
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.d_k = d_model // n_heads # Head size
+
+    # Fused QKV projection: 3*d_model params instead of 3 seprarate matrices
+    self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False) # W_QKV ∈ R^{d×3d}
+    self.out_proj = nn.Linear(d_model, d_model, bias=False)     # W_O ∈ R^{d×d}
+    self.dropout_p = dropout
+
+    print(f"\nFlashMultiHeadAttention initialized:")
+    print(f"  d_model={d_model}, n_heads={n_heads}, d_k={self.d_k}")
+    print(f"  QKV params: {d_model * 3 * d_model:,}")
+    print(f"  Output params: {d_model * d_model:,}\n")
+
+
+  def forward(self, x, mask=None):
+    batch_size, seq_len, _ = x.shape
+
+    # Fused QKV projection: x @ W_QKV
+    qkv = self.qkv_proj(x) # [B,L,d] @ [d,3d] = [B,L,3d]
+    print(f"\nQKV projection: {x.shape} -> {qkv.shape}")
+
+    # Reshape to split Q,K,V and heads
+    qkv = qkv.reshape(batch_size, seq_len, 3 , self.n_heads, self.d_k) # [B,L,3,h,d_k]
+    print(f"Reshape for heads: {qkv.shape}")
+
+    # Permute for parallel computation
+    qkv = qkv.permute(2,0,3,1,4) # [3,B,h,L,d_k] - Q,K,V first for easy splitting
+    Q,K,V = qkv[0], qkv[1], qkv[2] # qkv shape: [3, B, h, L, d_k] -> Q, K, V each: [B, h, L, d_k]  (Batch, Heads, Sequence length, Head dimension)
+    print(f"After permute: Q={Q.shape}, K={K.shape}, V={V.shape}")
+
+    # Apply Flash Attention or fallback
+    if torch.__version__ >="2.0" and torch.cuda.is_available():
+      print(f"Using Flash Attention kernel (O(N) memory)")
+
+      # Flash Attention: tiled computation without NxN matrices in HBM (High bandwidth mem)
+      # context tensor of shape [B, h, L, d_k] (same as Q/K/V) computed with fused attention kernel
+      context = F.scaled_dot_product_attention( # fused attention kernel
+          Q,K,V,
+          dropout_p = self.dropout_p if self.training else 0.0,  # before was if torch.is_grad_enabled() else 0.0
+          is_causal = True # Automatic causal masking
+      )
+
+      attn_weights = None # Not computed (to save memory)
+
+      print(f"Flash context: {context.shape}, computed via tiling")
+
+    else:
+
+      print(f"Fallback to standard attention (O(N²) memory)")
+      context, attn_weights = flash_attention_forward(Q,K,V, mask, self.dropout_p)
+
+
+    # Reshape: merge heads back
+    context = context.transpose(1,2).contiguous() # [B,h,L,d_k] -> [B,L,h,d_k]
+    context = context.view(batch_size, seq_len, self.d_model)   # [B,L,h*d_k] = [B,L,d] # Context needs d in the last dim shape to fit the nn.linear self.out_proj
+    print(f"Merged heads: {context.shape}")
+
+    # Final projection: context @ W_O
+    output = self.out_proj(context) # [B,L,d] @ [d,d] = [B,L,d]
+    print(f"Output projection: {output.shape}, norm: {output.norm(dim=-1).mean():.3f}")
+
+    return(output, attn_weights)
+
+def benchmark_flash_attention():
+  """
+  Compare Flash Attention with standard attention
+
+  Flash Attention advantages:
+  1. Memory: O(N) vs O(N²) - enables longer sequences
+  2. Speed: Better GPU utilization via kernel fusion
+  3. IO: Reduces HBM (slow memory) accesses
+  """
+
+  if not torch.cuda.is_available():
+    print("CUDA not available, skipping Flash Attention benchmark")
+    return
+
+  print("\n\nBenchmarking Flash Attention vs Standard Attention")
+  print("-"*60)
+
+  d_model, n_heads = 512, 8
+  seq_lengths = [128, 256, 512, 1024]
+  batch_size = 8
+
+  # Create models
+  standard_attn = MultiHeadAttention(d_model, n_heads).cuda()
+  flash_attn = FlashMultiHeadAttention(d_model, n_heads).cuda()
+
+  print(f"\nTest configuration:")
+  print(f"  Model dim: {d_model}, Heads: {n_heads}")
+  print(f"  Batch size: {batch_size}")
+  print(f"  Sequence lengths: {seq_lengths}\n")
+
+  results = []
+
+  for seq_len in seq_lengths:
+    x = torch.randn(batch_size, seq_len, d_model).cuda()
+    print(f"\nSequence length {seq_len}:")
+    print(f"  Input: {x.shape}, memory: {x.numel() * 4 / 1024**2:.2f} MB")
+
+    # Standard attention timing
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start = time.time()
+
+    for _ in range(10):
+      _, _ = standard_attn(x)
+
+    torch.cuda.synchronize()
+    standard_time = (time.time() - start) / 10
+    standard_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
+
+    # Flash attention timing
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start = time.time()
+
+    for _ in range(10):
+      _, _ = flash_attn(x)
+
+    torch.cuda.synchronize()
+    flash_time = (time.time() - start) / 10
+    flash_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
+
+    speedup = standard_time / flash_time
+    memory_ratio = standard_memory / flash_memory
+    results.append((seq_len, standard_time, flash_time, speedup, standard_memory, flash_memory))
+
+    print(f"  Standard: {standard_time:.4f}s, {standard_memory:.1f} MB")
+    print(f"  Flash:    {flash_time:.4f}s, {flash_memory:.1f} MB")
+    print(f"  Speedup: {speedup:.2f}x, Memory: {memory_ratio:.2f}x less")
+
+  # Theoretical complexity analysis
+  print(f"\n\nComplexity Analysis:")
+  print(f"  Standard Attention:")
+  print(f"    Time:  O(N²·d) for N×N matrix @ N×d")
+  print(f"    Space: O(N²·h) for h heads storing N×N matrices")
+  print(f"  Flash Attention:")
+  print(f"    Time:  O(N²·d/M) with block size M (better cache usage)")
+  print(f"    Space: O(N) - no full attention matrix\n")
+
+  # Visualization
+  plt.figure(figsize=(12, 5))
+
+  # Time comparison
+  plt.subplot(1, 3, 1)
+  seq_lens = [r[0] for r in results]
+  standard_times = [r[1] for r in results]
+  flash_times = [r[2] for r in results]
+
+  plt.plot(seq_lens, standard_times, 'o-', label='Standard', linewidth=2)
+  plt.plot(seq_lens, flash_times, 's-', label='Flash', linewidth=2)
+  plt.xlabel('Sequence Length')
+  plt.ylabel('Time (seconds)')
+  plt.title('Computation Time\n(lower is better)')
+  plt.legend()
+  plt.grid(True, alpha=0.3)
+
+  # Speedup
+  plt.subplot(1, 3, 2)
+  speedups = [r[3] for r in results]
+  bars = plt.bar(range(len(seq_lens)), speedups, color='green', alpha=0.7)
+  plt.xticks(range(len(seq_lens)), seq_lens)
+  plt.xlabel('Sequence Length')
+  plt.ylabel('Speedup Factor')
+  plt.title('Flash Attention Speedup\n(higher is better)')
+  plt.axhline(y=1, color='red', linestyle='--', alpha=0.5)
+
+  # Add value labels
+  for bar, speedup in zip(bars, speedups):
+    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+             f'{speedup:.1f}x', ha='center')
+  plt.grid(True, alpha=0.3, axis='y')
+
+  # Memory comparison
+  plt.subplot(1, 3, 3)
+  standard_mem = [r[4] for r in results]
+  flash_mem = [r[5] for r in results]
+
+  x = np.arange(len(seq_lens))
+  width = 0.35
+
+  plt.bar(x - width/2, standard_mem, width, label='Standard', alpha=0.7)
+  plt.bar(x + width/2, flash_mem, width, label='Flash', alpha=0.7)
+  plt.xlabel('Sequence Length')
+  plt.ylabel('Peak Memory (MB)')
+  plt.title('Memory Usage\n(lower is better)')
+  plt.xticks(x, seq_lens)
+  plt.legend()
+  plt.grid(True, alpha=0.3, axis='y')
+
+  plt.suptitle('Flash Attention: Trading Computation for Memory', fontsize=12)
+  plt.tight_layout()
+  plt.show()
+
+  print("1. Flash Attention overhead makes it slightly slower at short sequences, but it wins for 256+ tokens.\n")
+  print("2. Speedup increases with longer sequences due to better cache utilization. Speedup reaches about 2× at long contexts.\n")
+  print("3. Memory savings are huge, enabling much longer sequence training/inference.\n")
+  print(f"Trade-off: Can't retrieve attention weights (needed for some interpretability)\n")
+
+benchmark_flash_attention()
+
+
 
