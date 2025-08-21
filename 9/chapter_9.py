@@ -3219,5 +3219,276 @@ def benchmark_flash_attention():
 
 benchmark_flash_attention()
 
+"""# Optimization with torch.compile
 
+
+
+
+## JIT vs AOT
+
+### Just-in-Time (JIT)
+
+* Compilation occurs during execution.
+* Optimizations can adapt at runtime.
+* The first run is slower; later runs are faster.
+* Used in Java, JavaScript, and PyTorch.
+
+### Ahead-of-Time (AOT)
+
+* Compilation occurs fully before execution.
+* No runtime compilation overhead.
+* Startup is faster but optimizations are fixed.
+* Used in C, C++, Rust, and Go.
+
+In summary, JIT trades a slower first execution for adaptability and runtime optimization, while AOT favors faster startup and consistency at the cost of flexibility.
+
+"""
+
+def benchmark_torch_compile():
+  """
+  Benchmark torch.compile optimization:
+
+  Graph capture: python -> FX graph -> Triton/CUDA kernels
+
+  Operator fusion: recudes memory bandwith (pointwise ops merged)
+
+  Kernel optimization: better gpu occupancy and cache usage
+
+  Automatic mixed precision propagation with torch.autocast
+  """
+
+  if torch.__version__ < "2.0":
+    print(f"torch.compile requires PyTorch 2.0+, current: {torch.__version__}")
+    return
+
+  print("\n\nBenchmarking torch.compile (PyTorch 2.0+ JIT (Just In Time) compilation)")
+
+  # Create model
+  model = TransformerLM(
+      vocab_size= 1000,
+      d_model=256,
+      n_layers=4,
+      n_heads=8,
+      d_ff=1024     # FFN d_model -> d_ff -> d_model
+  ).to(device)
+
+  param_count = sum(p.numel() for p in model.parameters())
+
+  print(f"\nModel configuration:")
+  print(f"  Parameters: {param_count:,} ({param_count*4/1024**2:.1f} MB in FP32)")
+  print(f"  Architecture: {n_layers} layers × ({d_model}d, {n_heads}h)")
+
+  # Compile model with default mode
+  print(f"\nCompiling model with torch.compile()...")
+  print(f"  Backend: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+  print(f"  Process: Python -> FX Graph -> Triton IR -> PTX/SASS (GPU)") #The Triton open-source programming language and compiler offers a high-level, python-based approach to create efficient GPU code
+
+
+  model_compiled = torch.compile(model, mode='default') # Wraps the model in PyTorch’s new ahead-of-time compiler, torch.compile is just-in-time jit, On first call, it captures the Python model → FX graph → generates specialized Triton/CUDA kernels, the first call is slower because of the compilation, but the nexts are fast because of the cached kernels
+
+
+  # Test input
+  batch_size, seq_len = 8, 128
+  input_ids = torch.randint(0, 1000, (batch_size, seq_len)).to(device) # shape [B,L]
+  print(f"\nTest input: {input_ids.shape} tokens")
+  print(f"  Total tokens: {input_ids.numel():,}")
+  print(f"  FLOPs per token ≈ 2 × params = {2*param_count:,}")
+
+  # Warmup LR: trigger compilation and cache kernels
+  # First pass = compiles slow (build graph)
+  # Later passes = fast (compiled kernels cached)
+
+  print(f"\nWarmup phase (triggering JIT compilation)...")
+
+  print("Just-in-time (JIT) compilation compiles code while the program is running,")
+  print("instead of compiling everything ahead of time before execution.")
+  print("It blends the flexibility of interpreted code with the speed of compiled code.")
+  print("JIT identifies frequently executed sections and converts them into machine code at runtime,")
+  print("which improves performance while keeping portability.")
+  print("Languages like Java, JavaScript, and now PyTorch use JIT to optimize execution.")
+
+  for i in range(3):
+    with torch.no_grad():
+      logits, _ = model(input_ids)   # eager mode [B, L, vocab_size]
+
+      if i == 0:
+        print(f"  First pass (eager): logits {logits.shape}")
+
+
+      logits_compiled, _ = model_compiled(input_ids)  # triggers graph build
+      if i == 0:
+        print(f"  First pass (compiling): building optimized graph...")
+
+  # Benchmark config
+  n_iterations = 20
+  print(f"\nBenchmarking {n_iterations} iterations...")
+  # Standard model (eager execution)
+  torch.cuda.synchronize() if torch.cuda.is_available() else None
+  start = time.time()
+
+  with torch.no_grad():
+    for _ in range(n_iterations):
+      logits, _ = model(input_ids)  # [B, L] -> [B, L, V]
+
+  torch.cuda.synchronize() if torch.cuda.is_available() else None
+  standard_time = time.time() - start
+  standard_throughput = (n_iterations * batch_size * seq_len) / standard_time  # tokens/sec
+
+  # Compiled model (optimized execution)
+  torch.cuda.synchronize() if torch.cuda.is_available() else None
+  start = time.time()
+
+  with torch.no_grad():
+    for _ in range(n_iterations):
+      logits, _ = model_compiled(input_ids)  # Same shapes, fused kernels
+
+  torch.cuda.synchronize() if torch.cuda.is_available() else None
+  compiled_time = time.time() - start
+  compiled_throughput = (n_iterations * batch_size * seq_len) / compiled_time
+
+  speedup = standard_time / compiled_time
+
+  print(f"\nResults (default mode):")
+  print(f"  Standard model: {standard_time:.3f}s ({standard_throughput:.0f} tokens/s)")
+  print(f"  Compiled model: {compiled_time:.3f}s ({compiled_throughput:.0f} tokens/s)")
+  print(f"  Speedup: {speedup:.2f}x")
+  print(f"  Latency reduction: {(standard_time-compiled_time)/n_iterations*1000:.1f}ms per forward pass")
+
+  # Test different compile modes
+  print(f"\n\nTesting different compilation modes:")
+  print(f"  default: Balanced compile time vs runtime")
+  print(f"  reduce-overhead: Minimize kernel launch overhead (good for small models)")
+  print(f"  max-autotune: Exhaustive optimization (slow compile, fast runtime)")
+
+  modes = ['default', 'reduce-overhead', 'max-autotune']
+  results = []
+
+  for mode in modes:
+    try:
+      print(f"\nMode '{mode}':")
+      print(f"  Compiling... ", end="")
+
+      compile_start = time.time()
+      model_mode = torch.compile(model, mode=mode)
+
+      # Warmup: measure compilation time
+      with torch.no_grad():
+        for i in range(2):
+          _, _ = model_mode(input_ids)
+          if i == 0:
+            compile_time = time.time() - compile_start
+            print(f"took {compile_time:.2f}s")
+
+      # Benchmark runtime
+      torch.cuda.synchronize() if torch.cuda.is_available() else None
+      start = time.time()
+
+      with torch.no_grad():
+        for _ in range(n_iterations):
+          _, _ = model_mode(input_ids)
+
+      torch.cuda.synchronize() if torch.cuda.is_available() else None
+      mode_time = time.time() - start
+      mode_throughput = (n_iterations * batch_size * seq_len) / mode_time
+
+      results.append((mode, mode_time, compile_time))
+      print(f"  Runtime: {mode_time:.3f}s ({mode_throughput:.0f} tokens/s)")
+      print(f"  Speedup vs eager: {standard_time/mode_time:.2f}x")
+
+      # Mode-specific optimizations
+      if mode == 'reduce-overhead':
+        print(f"  Optimizations: Reduced kernel launches, cudaGraphs")
+      elif mode == 'max-autotune':
+        print(f"  Optimizations: Tuned GEMM tiles, layout optimization, aggressive fusion")
+
+    except Exception as e:
+      print(f"failed: {e}")
+
+  # Visualize results
+  if results:
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    modes, times, compile_times = zip(*results)
+
+    # Runtime comparison
+    x = np.arange(len(modes))
+    colors = ['blue', 'green', 'red']
+    bars = ax1.bar(x, times, color=colors, alpha=0.7)
+    ax1.axhline(y=standard_time, color='gray', linestyle='--', label='Eager (baseline)')
+    ax1.set_xlabel('Compile Mode')
+    ax1.set_ylabel('Runtime (seconds)')
+    ax1.set_title(f'Runtime Performance\n({n_iterations} iterations)')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(modes)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    # Add speedup labels
+    for bar, time_unit in zip(bars, times):
+      speedup = standard_time / time_unit
+      ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+               f'{speedup:.2f}x', ha='center', fontsize=10)
+
+    # Compile time vs runtime tradeoff
+    ax2.scatter(compile_times, times, s=100, c=colors, alpha=0.7)
+    for mode, ct, rt in zip(modes, compile_times, times):
+      ax2.annotate(mode, (ct, rt), xytext=(5, 5), textcoords='offset points')
+    ax2.set_xlabel('Compilation Time (seconds)')
+    ax2.set_ylabel('Runtime (seconds)')
+    ax2.set_title('Compile Time vs Runtime Tradeoff')
+    ax2.grid(True, alpha=0.3)
+
+    # Add Pareto frontier
+    ax2.axhline(y=standard_time, color='gray', linestyle='--', alpha=0.5)
+    ax2.text(max(compile_times)*0.5, standard_time+0.05, 'Eager baseline', fontsize=9)
+
+    plt.suptitle('torch.compile: Trading Compilation Time for Runtime Performance', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+
+  print("\n\n")
+  print(f"\nFor this small model, all compile modes give modest speedup over eager execution.")
+  print(f"Aggressive optimization (max-autotune) does not provide a big runtime benefit here.")
+
+  print(f"\ntorch.compile benefits are most pronounced with larger models (100M+ parameters)")
+  print(f"Small models don't have enough compute to amortize compilation overhead")
+
+  print(f"\nExpected Results for Larger Scale")
+  print(f"For comparison, torch.compile typically shows 1.3-2.5x speedups on:")
+  print(f"  • Large language models (GPT-2, LLaMA-style, 7B+ parameters)")
+  print(f"  • Long sequences (1024+ tokens)")
+  print(f"  • Large batch sizes (32+ sequences)")
+  print(f"  • Training workloads (backward pass has more fusion opportunities)")
+
+
+  # Kernel fusion analysis
+  print(f"\n\nKernel Fusion Benefits:")
+  print(f"  Unfused (eager mode):")
+  print(f"    LayerNorm: Read N×d, Write N×d -> 2×N×d memory ops")
+  print(f"    GELU: Read N×d, Write N×d -> 2×N×d memory ops")
+  print(f"    Total: 4×N×d memory transfers")
+  print(f"\n  Fused (compiled):")
+  print(f"    LayerNorm+GELU: Read N×d, Write N×d -> 2×N×d memory ops")
+  print(f"    Savings: 50% memory bandwidth")
+
+  # Memory bandwidth calculation
+  if torch.cuda.is_available():
+    elements_per_op = batch_size * seq_len * d_model
+    bytes_per_element = 4  # FP32
+    unfused_bandwidth = 4 * elements_per_op * bytes_per_element * n_iterations / standard_time / 1024**3  # GB/s
+    fused_bandwidth = 2 * elements_per_op * bytes_per_element * n_iterations / compiled_time / 1024**3
+
+    print(f"\n  Estimated bandwidth utilization:")
+    print(f"    Unfused: {unfused_bandwidth:.1f} GB/s")
+    print(f"    Fused: {fused_bandwidth:.1f} GB/s")
+
+  print(f"\n\nKey Insights:")
+  print(f"1. torch.compile fuses pointwise ops (LayerNorm, GELU, dropout) reducing memory traffic")
+  print(f"2. Graph optimization eliminates Python overhead and framework dispatching")
+  print(f"3. Triton generates GPU kernels optimized for specific shapes")
+  print(f"4. cudaGraphs (reduce-overhead) capture entire forward pass, single kernel launch")
+  print(f"5. Trade-off: Compilation time (once) vs runtime speedup (every forward)")
+
+benchmark_torch_compile()
 
