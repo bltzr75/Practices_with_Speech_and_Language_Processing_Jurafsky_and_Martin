@@ -4024,3 +4024,284 @@ def compare_generation_methods():
 
 compare_generation_methods()
 
+"""# Gradient Checkpointing
+
+
+Normally, during training:
+- In the forward pass, activations (intermediate outputs) are stored for each layer.
+- In the backward pass, gradients are computed using those stored activations.
+
+
+Problem:
+- For deep models (like Transformers with dozens of layers), storing all activations eats up huge amounts of GPU memory.
+
+
+Checkpointing solves this:
+
+- Instead of storing activations, PyTorch discards them and recomputes them during the backward pass.
+
+- Saves memory, but makes training slower because of recomputation.
+
+
+
+####Arguments description:
+
+* **function**: The forward computation to run. Must handle inputs correctly if given as a tuple (e.g., `(activation, hidden)` for an LSTM).
+* **preserve\_rng\_state (bool, default=True)**: Whether to save and restore RNG (random number generator) state during checkpointing. Ignored under `torch.compile`, where RNG state is always preserved.
+* **use\_reentrant (bool)**: Determines the checkpoint variant.
+
+  * `True` (default) uses reentrant autograd.
+  * `False` uses a non-reentrant variant, supporting keyword arguments and compatibility with `torch.autograd.grad`. Required to be specified explicitly in PyTorch 2.5.
+
+"""
+
+from torch.utils.checkpoint import checkpoint
+
+class CheckpointedTransformerBlock(nn.Module):
+  """
+  Transformer block with Gradient Checkpointing
+
+  Activation checkpointing is a technique that trades compute for memory.
+  Instead of keeping tensors needed for backward alive until they are used in
+  gradient computation during backward, forward computation in checkpointed
+  regions omits saving tensors for backward and recomputes them during the
+  backward pass. Activation checkpointing can be applied to any part of a
+  model.
+
+  """
+
+  def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1):
+    super().__init__()
+    self.attention = MultiHeadAttention(d_model, n_heads, dropout)
+
+    self.norm1 = nn.LayerNorm(d_model)
+    self.ffn = FeedForward(d_model, d_ff,dropout)
+
+    self.norm2 = nn.LayerNorm(d_model)
+    self.dropout = nn.Dropout(dropout)
+
+  # In the forward pass, activations (intermediate outputs) are stored for each layer.
+  def forward(self, x, mask = None):
+
+    # Checkpointed Attention: "sub-function" to checkpoint
+    def attention_block(x):
+      return( self.attention(self.norm1(x), mask)[0])
+
+    # Use checkpointing if training, otherwise normal forward
+    if self.training:
+      attn_out = checkpoint(attention_block, x, use_reentrant=False) # discards activations, does not save the intermediates from the function(x), and instead during the backward pass recomputes the function(x)
+
+    # Note: passing the "use_reentrant=False" only to avoid warning: "torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly". Recommendation: Adding use_reentrant=False to avoid reentrant autograd if not necessary.
+
+    else:
+      attn_out = attention_block(x)
+
+    x = x + self.dropout(attn_out)     # Residual flow
+
+
+    # Checkpointed FFN
+    def ffn_block(x):
+      return(self.ffn(self.norm2(x)))
+
+
+    # Use checkpointing if training, otherwise normal forward
+    if self.training:
+      ffn_out = checkpoint(ffn_block, x, use_reentrant=False) # discards activations, does not save the intermediates from the function(x), and instead during the backward pass recomputes the function(x)
+
+    # Note: passing the "use_reentrant=False" only to avoid warning: "torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly". Recommendation: Adding use_reentrant=False to avoid reentrant autograd if not necessary.
+
+
+    else:
+      ffn_out = ffn_block(x)
+
+    x = x + self.dropout(ffn_out)     # Residual flow
+
+    return(x, None)
+
+def compare_memory_usage():
+    """Compare memory usage with and without gradient checkpointing"""
+
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping memory comparison")
+        return
+
+    d_model = 512
+    n_heads = 8
+    n_layers = 12
+    seq_len = 512
+    batch_size = 4
+
+    # Model without checkpointing
+    class StandardTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([
+                TransformerBlock(d_model, n_heads) for _ in range(n_layers)
+            ])
+
+        def forward(self, x):
+            for block in self.blocks:
+                x, _ = block(x)
+            return x
+
+    # Model with checkpointing
+    class CheckpointedTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([
+                CheckpointedTransformerBlock(d_model, n_heads) for _ in range(n_layers)
+            ])
+
+        def forward(self, x):
+            for block in self.blocks:
+                x, _ = block(x)
+            return x
+
+    # Test input
+    x = torch.randn(batch_size, seq_len, d_model, device=device, requires_grad=True)
+    target = torch.randn(batch_size, seq_len, d_model, device=device)
+
+    # Standard model
+    torch.cuda.reset_peak_memory_stats()
+    standard_model = StandardTransformer().cuda()
+    standard_model.train()
+
+    output = standard_model(x)
+    loss = F.mse_loss(output, target)
+    loss.backward()
+
+    standard_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
+
+    # Checkpointed model
+    torch.cuda.reset_peak_memory_stats()
+    checkpointed_model = CheckpointedTransformer().cuda()
+    checkpointed_model.train()
+
+    output = checkpointed_model(x)
+    loss = F.mse_loss(output, target)
+    loss.backward()
+
+    checkpointed_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
+
+    print(f"Memory usage comparison:")
+    print(f"Standard model: {standard_memory:.2f} MB")
+    print(f"Checkpointed model: {checkpointed_memory:.2f} MB")
+    print(f"Memory saved: {standard_memory - checkpointed_memory:.2f} MB")
+    print(f"Reduction: {(1 - checkpointed_memory/standard_memory)*100:.1f}%")
+
+    # Visualize trade-offs
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Memory comparison
+    models = ['Standard', 'Checkpointed']
+    memories = [standard_memory, checkpointed_memory]
+
+    axes[0].bar(models, memories, color=['red', 'green'])
+    axes[0].set_ylabel('Memory (MB)')
+    axes[0].set_title('Memory Usage Comparison')
+    axes[0].grid(True, alpha=0.3, axis='y')
+
+    # Time comparison (checkpointing is slower)
+    # Measure forward + backward time
+    import time
+
+    times = []
+    for model, name in [(standard_model, 'Standard'),
+                        (checkpointed_model, 'Checkpointed')]:
+        torch.cuda.synchronize()
+        start = time.time()
+
+        for _ in range(10):
+            output = model(x)
+            loss = F.mse_loss(output, target)
+            loss.backward()
+            model.zero_grad()
+
+        torch.cuda.synchronize()
+        elapsed = time.time() - start
+        times.append(elapsed)
+
+    axes[1].bar(models, times, color=['blue', 'orange'])
+    axes[1].set_ylabel('Time (seconds)')
+    axes[1].set_title('Speed Comparison (10 iterations)')
+    axes[1].grid(True, alpha=0.3, axis='y')
+
+    plt.suptitle('Gradient Checkpointing Trade-offs')
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\nTime comparison:")
+    print(f"Standard: {times[0]:.3f}s")
+    print(f"Checkpointed: {times[1]:.3f}s")
+    print(f"Slowdown: {times[1]/times[0]:.2f}x")
+
+compare_memory_usage()
+
+"""#Checkpoint as a “save-and-resume”
+
+Gradient checkpointing and save-and-resume are two distinct mechanisms in PyTorch. Gradient checkpointing is a memory optimization technique and is unrelated to persisting training progress. In contrast, save-and-resume is concerned with capturing the training state to allow continuation after interruption.
+
+For save-and-resume, the following elements are typically preserved:
+
+1. Model parameters, using `model.state_dict()`.
+2. Optimizer state, using `optimizer.state_dict()`.
+3. Learning rate scheduler state, if present, using `scheduler.state_dict()`.
+4. Training step or epoch counter.
+5. Random number generator states for reproducibility, via `torch.get_rng_state()` and, if applicable, `numpy` RNG states.
+
+A checkpoint can be saved as follows:
+
+```python
+import torch
+
+checkpoint = {
+    "model_state": model.state_dict(),
+    "optimizer_state": optimizer.state_dict(),
+    "scheduler_state": scheduler.state_dict() if scheduler else None,
+    "step": current_step,
+    "rng_state": torch.get_rng_state() # Random Number Generator
+}
+torch.save(checkpoint, "checkpoint.pt")
+```
+
+To resume training, the checkpoint is loaded and the stored states restored:
+
+```python
+checkpoint = torch.load("checkpoint.pt")
+model.load_state_dict(checkpoint["model_state"])
+optimizer.load_state_dict(checkpoint["optimizer_state"])
+if scheduler and checkpoint["scheduler_state"]:
+    scheduler.load_state_dict(checkpoint["scheduler_state"])
+current_step = checkpoint["step"]
+torch.set_rng_state(checkpoint["rng_state"]) # Random Number Generator
+```
+
+For large-scale language models, additional considerations include:
+
+* Sharding model weights across multiple files to accommodate GPU memory constraints.
+* Saving at intervals, rather than every batch, to balance storage requirements and fault tolerance.
+* Using reduced-precision formats (e.g., FP16 or BF16) to reduce checkpoint size.
+* For distributed training, frameworks such as DeepSpeed or Hugging Face Accelerate manage sharded checkpoints efficiently, preserving model, optimizer, and RNG states.
+
+In a typical training loop, periodic checkpointing ensures that training can be resumed with identical model and optimizer states, maintaining reproducibility and continuity:
+
+```python
+for step, batch in enumerate(dataloader, start=start_step):
+    optimizer.zero_grad()
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.step()
+    
+    if step % checkpoint_interval == 0:
+        torch.save({
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler else None,
+            "step": step,
+            "rng_state": torch.get_rng_state()
+        }, f"checkpoint_{step}.pt")
+```
+
+The procedure allows training to resume exactly from the last saved state, including optimizer momentum and learning rate schedule.
+
+"""
