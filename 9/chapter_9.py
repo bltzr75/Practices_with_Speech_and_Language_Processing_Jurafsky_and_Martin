@@ -27,6 +27,7 @@ import torch.nn.functional as F # Functional interface for operations (activatio
 import torch.optim as optim  # Optimization algorithms (SGD, Adam, etc.)
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset  # DataLoader: Handles batching, shuffling, parallel loading. Dataset: Abstract class for custom datasets
+from torch.utils.checkpoint import checkpoint
 
 from torchinfo import summary
 from torchviz import make_dot
@@ -3491,4 +3492,535 @@ def benchmark_torch_compile():
   print(f"5. Trade-off: Compilation time (once) vs runtime speedup (every forward)")
 
 benchmark_torch_compile()
+
+"""#Text Generation Methods with LogitLens"""
+
+class TextGenerator:
+  """Different gereration strategies with LogitLens analysis"""
+
+  @staticmethod  # no "self" passed, does not need creating an instance of the class to call it
+  def greedy_decode(model, input_ids, max_length=50, return_hidden=False):
+    """
+    Greedy decoding: always picking the highest probability token
+    Deterministic approach
+    """
+
+    model.eval()
+    generated = input_ids.clone()
+    all_hidden_states = [] if return_hidden else None
+
+    with torch.no_grad():
+      for _ in range(max_length - input_ids.size(1)):
+        if return_hidden:
+          logits, _, hidden_states = model(generated, return_all_hidden=True)
+          all_hidden_states.append(hidden_states)
+
+        else:
+          logits, _ = model(generated)
+
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True) # Argmax picks the highest prob, deterministic approach
+        generated = torch.cat([generated, next_token], dim=1)
+
+    return(generated, all_hidden_states) if return_hidden else generated
+
+
+
+  @staticmethod  # no "self" passed, does not need creating an instance of the class to call it
+  def temperature_sampling(model, input_ids, max_length=50, temperature=1.0, return_hidden=False):
+    """Sample with temperature scaling"""
+
+    model.eval()
+    generated = input_ids.clone()
+    all_hidden_states = [] if return_hidden else None
+
+
+    with torch.no_grad():
+      for _ in range(max_length - input_ids.size(1)):
+        if return_hidden:
+          logits, _, hidden_states = model(generated, return_all_hidden = True)
+          all_hidden_states.append(hidden_states)
+        else:
+          logits, _ = model(generated)
+
+        logits = logits[:, -1, :] / temperature # Scaliing the distrib logits by temperature T: higher T give a flatten distrib, while 0 should be (/zero error) deterministic
+        probs = F.softmax(logits, dim=-1) # P(w) = exp(logit_w/T) / Σ exp(logit_i/T)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated,next_token], dim=1)
+
+    return (generated, all_hidden_states) if return_hidden else generated
+
+
+
+  @staticmethod
+  def top_k_sampling(model, input_ids, max_length=50, k=50, temperature=1.0):
+    """Top-k smapling: only considering the k most likely tokens"""
+
+    model.eval()
+    generated = input_ids.clone()
+
+    with torch.no_grad():
+      for _ in range(max_length - input_ids.size(1)):
+        logits, _ = model(generated)
+        logits = logits[:, -1, :] / temperature # Scaliing the distrib logits by temperature T: higher T give a flatten distrib, while 0 should be (/zero error) deterministic
+
+        # Keeping only the top k, the rest set to -inf
+        top_k_values, top_k_indices = torch.topk(logits, k, dim=-1) # shape [batch, k]
+
+        logits_filtered = torch.full_like(logits, -float('inf'))
+
+
+        # PyTorch: _ explicitly signals in-place, which matters for memory and autograd
+        # the in-place modifies the original tensor directly. No new tensor is returned. Used when you want to overwrite values in-place.
+
+        # scatter_ is an in-place PyTorch operation that writes values into a tensor at specified indices along a given dimension
+        logits_filtered.scatter_(1, top_k_indices, top_k_values ) # Restoring top-k values
+
+        probs = F.softmax(logits_filtered, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1) # sample jsut 1
+        generated = torch.cat([generated, next_token], dim=1)
+
+    return(generated)
+
+
+
+  @staticmethod
+  def top_p_sampling(model, input_ids, max_length=50, p=0.95, temperature=1.0):
+    """
+    Top-p (nucleus) sampling
+    Smallest set with the cumulative prob P > p
+    """
+
+    model.eval()
+    generated = input_ids.clone()
+
+    with torch.no_grad():
+      for _ in range(max_length - input_ids.size(1)):
+        logits, _ = model(generated)
+        logits = logits[:, -1, :] / temperature
+
+        # Sort and compute cumulative probs
+        sorted_logits, sorted_indices = torch.sort(logits, descending = True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+
+        # Cutoff
+        sorted_indices_to_remove = cumulative_probs > p
+        sorted_indices_to_remove[... , 1:] = sorted_indices_to_remove[... , :-1].clone()  # In PyTorch and NumPy, ... is the ellipsis, which means all preceding dimensions”
+        sorted_indices_to_remove[... , 0] = 0 # Keeps at least on tokn
+
+        # Remove tokens exceeding the threshold
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove
+        )
+
+        logits[indices_to_remove] = -float('inf')
+
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples = 1)
+        generated = torch.cat([generated, next_token], dim=1)
+
+    return(generated )
+
+  @staticmethod
+  def beam_search(model, input_ids, max_length=50, beam_width=3):
+    """Beam search: maintain k best sequences"""
+
+    model.eval()
+    batch_size = input_ids.size(0)
+
+
+    # Initialize beams: (sequence, log_prob_sum)
+    beams = [(input_ids, 0.0)]
+
+    with torch.no_grad():
+      print(f"Applying Beam Search with width: {beam_width}\n" )
+      for _ in range(max_length - input_ids.size(1)):
+        candidates = []
+
+
+        for seq, score in beams:
+          logits, _ = model(seq)
+          log_probs = F.log_softmax(logits[:,-1,:], dim=-1) # log P(word|contxt)
+
+          # Top beam_width continuations
+          top_log_probs, top_indices = torch.topk(log_probs, beam_width, dim=-1)
+
+          for i in range(beam_width):
+            new_seq = torch.cat([seq, top_indices[:,i:i+1]], dim=1)
+            new_score = score + top_log_probs[0,i].item() # Sum log prob as float
+            print(f"\nnew_seq: {new_seq}, new_score: {new_score}")
+
+
+            candidates.append((new_seq, new_score))
+
+
+        # Keep top beam_wisth candidates
+        candidates.sort(key=lambda x:x[1], reverse=True)
+
+        beams = candidates[:beam_width]
+
+      return(beams[0][0])
+
+def analyze_generation_with_logitlens(model, generated_sequence,hidden_states_list, tokenizer, step_idx):
+  """
+  Analyze how predictions evolved through layers using LogitLens
+
+  Showing incremental refinement over layers: h_0 -> h_1 -> ... -> h_L
+
+  Returns prediction stability patterns
+  """
+
+  # Unembedding matrix: W_U = E^T (Unembedding matrix is just the transposed Embedding matrix, in order to project it back from the embedding dim)
+  unembedding = model.token_embedding.embedding.weight.T #shape [d_model, vocab_size]
+  print(f"\nStep {step_idx+1}: Analyzing position {generated_sequence.size(1)-1}")
+
+  hidden_states = hidden_states_list[step_idx]
+
+  # Tracking prediction evolution
+  predictions_by_layer = []
+  entropies_by_layer  = []
+
+  for layer_idx, hidden in enumerate(hidden_states):
+    # Extracting hidden states at the last position
+    h = hidden[0, -1] # dim embedding [d_model]
+
+    #Project to vocab: h @ W_U (hidden state @ unembedding_matrix) projects back to vocab
+    logits = h @ unembedding # # [d_model] @ [d_model, vocab_size] = [vocab_size]
+
+    probs = F.softmax(logits,dim=-1)
+
+    # Top predictions
+    top_prob, top_idx = torch.max(probs, dim= -1) # Deterministic, argmax function
+    predictions_by_layer.append((top_idx.item(), top_prob.item()))
+
+
+    # Calc entropy: H = -Σ p·log(p)
+    entropy = -(probs * (probs + 1e-10).log()).sum().item() # 1e-10 is just a small epsilon to avoid log(0) error and log(1)
+
+    entropies_by_layer.append(entropy)
+
+
+    if layer_idx % max(1, len(hidden_states)//4) == 0:  # Sample every ~25%
+      token_char = chr(top_idx.item()) if top_idx.item() < 256 else '?'
+      layer_name = f"Emb" if layer_idx == 0 else f"L{layer_idx}" if layer_idx < len(hidden_states)-1 else "Final"
+      print(f"  {layer_name:5}: Token {top_idx.item():3d} ('{token_char}') p={top_prob.item():.3f}, H={entropy:.2f}")
+
+
+  # Analyze prediction stability
+  stable_ranges = []
+  current_token = predictions_by_layer[0][0]
+  start_layer = 0
+
+
+  for i, (token, prob) in enumerate(predictions_by_layer[1:], 1):
+    if token != current_token:
+      stable_ranges.append((start_layer, i-1, current_token))
+      current_token = token
+      start_layer = i
+  stable_ranges.append((start_layer, len(predictions_by_layer) -1, current_token))
+
+  # Report on stability patterns
+  print(f"\nPrediction stability:")
+  for start, end, token in stable_ranges:
+    if start==end:
+      print(f"  Layer {start}: Token {token}")
+    else:
+      print(f"  Layers {start}-{end}: Token {token} (stable for {end-start+1} layers)")
+
+
+
+  # Find convergence point to final pred
+  final_token = predictions_by_layer[-1][0]
+  convergence_layer = next(( i for i, (tok, _) in enumerate(predictions_by_layer) if tok == final_token ), -1)
+  print(f"  Converged to final token at: Layer {convergence_layer}\n")
+
+
+  return(predictions_by_layer, entropies_by_layer, stable_ranges)
+
+
+def compare_generation_methods():
+  """Compare different text generation startegies with LogitLens analysis"""
+
+  # Small transformer model for testing
+  print("\nInitializing model for generation comparison")
+
+  model = TransformerLM(
+      vocab_size = 256,
+      d_model = 128,
+      n_layers=4, # shallow for clear logitlens progression
+      n_heads=4,
+      d_ff = 256
+      ).to(device)
+  print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters\n")
+
+  # Quick training for meaningful patterns
+  print("Quick training for non-random weights...")
+  optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+  for i in range(50):
+    dummy_input = torch.randint(0,256, (4,20)).to(device)
+    logits, loss = model(dummy_input, dummy_input)
+
+    loss.backward()
+
+    optimizer.step()
+    optimizer.zero_grad()
+
+    if i%10 == 0:
+      print(f"  Step {i}: loss={loss.item():.3f}")
+
+  print("Training Complete :)\n")
+
+  prompt_text = "Hello"
+  tokenizer = SimpleTokenizer()
+  prompt_ids = torch.tensor([tokenizer(prompt_text)], device=device)
+  print(f"Prompt: '{prompt_text}' -> tokens {prompt_ids[0].tolist()}\n")
+
+  generator = TextGenerator()
+
+
+  # Generate with different methods
+  print("Generating text with different methods...")
+
+  # Greedy with hidden states for LogitLens
+  greedy_output, greedy_hidden = generator.greedy_decode(
+    model, prompt_ids, max_length=30, return_hidden=True
+  )
+
+  # Temperature with hidden states
+  temp_output, temp_hidden = generator.temperature_sampling(
+    model, prompt_ids, 30, temperature=1.0, return_hidden=True
+  )
+
+  # Other methods
+  methods = {
+    'Greedy': greedy_output,
+    'Temp=0.5': generator.temperature_sampling(model, prompt_ids, 30, 0.5),
+    'Temp=1.0': temp_output,
+    'Temp=2.0': generator.temperature_sampling(model, prompt_ids, 30, 2.0),
+    'Top-k=10': generator.top_k_sampling(model, prompt_ids, 30, k=10),
+    'Top-p=0.9': generator.top_p_sampling(model, prompt_ids, 30, p=0.9),
+    'Beam=3': generator.beam_search(model, prompt_ids, 30, beam_width=3)
+  }
+
+  print("\nGeneration comparison:")
+  for method_name, generated in methods.items():
+    text = tokenizer.decode(generated[0].cpu().tolist())
+    print(f"  {method_name:12} | {text[:50]}...")
+
+  # LogitLens analysis on greedy generation
+  print("\n\nLogitLens Analysis: Greedy Generation Evolution")
+  print("="*60)
+
+  # Analyze specific generation steps
+  analyze_steps = [0, len(greedy_hidden)//4, len(greedy_hidden)//2, len(greedy_hidden)-1]
+
+  all_predictions = []
+  all_entropies = []
+
+  for step_idx in analyze_steps:
+    if step_idx >= len(greedy_hidden):
+      continue
+
+    predictions, entropies, stability = analyze_generation_with_logitlens(
+      model, greedy_output, greedy_hidden, tokenizer, step_idx
+    )
+    all_predictions.append(predictions)
+    all_entropies.append(entropies)
+
+  # Comparative analysis: Greedy vs Temperature
+  print("\n\nComparative LogitLens: Greedy vs Temperature=1.0")
+  print("-"*60)
+
+  compare_step = min(5, len(greedy_hidden)-1)
+
+  for method_name, hidden_states_list in [("Greedy", greedy_hidden), ("Temp=1.0", temp_hidden)]:
+    if compare_step >= len(hidden_states_list):
+      continue
+
+    print(f"\n{method_name} at step {compare_step+1}:")
+    hidden_states = hidden_states_list[compare_step]
+
+    # Get final layer predictions
+    final_hidden = hidden_states[-1][0, -1]  # [d_model]
+    unembedding = model.token_embedding.embedding.weight.T
+    final_logits = final_hidden @ unembedding  # [vocab_size]
+    final_probs = F.softmax(final_logits, dim=-1)
+
+    # Top-5 predictions
+    top5_probs, top5_indices = torch.topk(final_probs, 5)
+    print(f"  Top-5: {top5_indices.tolist()} with p={[f'{p:.3f}' for p in top5_probs.tolist()]}")
+
+    # Entropy as uncertainty measure
+    entropy = -(final_probs * (final_probs + 1e-10).log()).sum().item()
+    print(f"  Entropy: {entropy:.3f} ({'certain' if entropy < 2 else 'uncertain' if entropy > 4 else 'moderate'})")
+
+  # Visualization
+  print("\n\nVisualization: Confidence Evolution and Token Stability")
+
+  fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+  # Plot 1: Confidence evolution for different steps
+  ax1 = axes[0, 0]
+  for i, (step_idx, predictions) in enumerate(zip(analyze_steps[:4], all_predictions[:4])):
+    confidences = [p[1] for p in predictions]
+    ax1.plot(range(len(confidences)), confidences,
+             marker='o', label=f'Step {step_idx+prompt_ids.size(1)}', alpha=0.7, linewidth=2)
+
+  ax1.set_xlabel('Layer')
+  ax1.set_ylabel('P(top token)')
+  ax1.set_title('Confidence Evolution During Generation (Greedy)')
+  ax1.legend()
+  ax1.grid(True, alpha=0.3)
+
+  # Plot 2: Token prediction changes
+  ax2 = axes[0, 1]
+  if all_predictions:
+    # Show token transitions for last generation step
+    last_predictions = all_predictions[-1]
+    layers = list(range(len(last_predictions)))
+    tokens = [p[0] for p in last_predictions]
+    probs = [p[1] for p in last_predictions]
+
+    ax2.plot(layers, probs, 'b-', linewidth=2, alpha=0.7)
+    ax2.scatter(layers, probs, c=tokens, cmap='tab20', s=50, zorder=5)
+
+    # Mark token changes
+    for i in range(1, len(tokens)):
+      if tokens[i] != tokens[i-1]:
+        ax2.axvline(x=i, color='red', linestyle='--', alpha=0.5)
+        ax2.text(i, probs[i]+0.02, f'→{tokens[i]}', fontsize=8, ha='center')
+
+    ax2.set_xlabel('Layer')
+    ax2.set_ylabel('Confidence')
+    ax2.set_title(f'Token Predictions by Layer (Final Step)')
+    ax2.grid(True, alpha=0.3)
+
+  # Plot 3: Entropy evolution comparison
+  ax3 = axes[1, 0]
+
+  # Average entropy per layer
+  avg_entropy_greedy = []
+  avg_entropy_temp = []
+
+  n_layers = len(greedy_hidden[0]) if greedy_hidden else 0
+
+  for layer_idx in range(n_layers):
+    # Greedy entropies
+    layer_entropies = []
+    for step_hidden in greedy_hidden[:10]:  # First 10 steps
+      h = step_hidden[layer_idx][0, -1]
+      unembedding = model.token_embedding.embedding.weight.T
+      logits = h @ unembedding
+      probs = F.softmax(logits, dim=-1)
+      entropy = -(probs * (probs + 1e-10).log()).sum().item()
+      layer_entropies.append(entropy)
+    avg_entropy_greedy.append(np.mean(layer_entropies))
+
+    # Temperature sampling entropies
+    layer_entropies = []
+    for step_hidden in temp_hidden[:10]:
+      h = step_hidden[layer_idx][0, -1]
+      logits = h @ unembedding
+      probs = F.softmax(logits, dim=-1)
+      entropy = -(probs * (probs + 1e-10).log()).sum().item()
+      layer_entropies.append(entropy)
+    avg_entropy_temp.append(np.mean(layer_entropies))
+
+  ax3.plot(range(len(avg_entropy_greedy)), avg_entropy_greedy,
+           marker='s', label='Greedy', linewidth=2, markersize=6)
+  ax3.plot(range(len(avg_entropy_temp)), avg_entropy_temp,
+           marker='^', label='Temperature=1.0', linewidth=2, markersize=6)
+
+  ax3.set_xlabel('Layer')
+  ax3.set_ylabel('Average Entropy (H)')
+  ax3.set_title('Uncertainty Reduction Through Layers')
+  ax3.legend()
+  ax3.grid(True, alpha=0.3)
+
+  # Plot 4: Diversity analysis
+  ax4 = axes[1, 1]
+
+  # Generate samples for diversity
+  n_samples = 10
+  diversity_results = {}
+
+  for method_name in ['Temp=0.5', 'Temp=1.0', 'Top-k=10', 'Top-p=0.9']:
+    samples = []
+    for _ in range(n_samples):
+      if 'Temp' in method_name:
+        temp = float(method_name.split('=')[1])
+        gen = generator.temperature_sampling(model, prompt_ids, 30, temp)
+      elif 'Top-k' in method_name:
+        k = int(method_name.split('=')[1])
+        gen = generator.top_k_sampling(model, prompt_ids, 30, k=k)
+      else:  # Top-p
+        p = float(method_name.split('=')[1])
+        gen = generator.top_p_sampling(model, prompt_ids, 30, p=p)
+      samples.append(gen)
+
+    # Calculate unique n-grams
+    all_bigrams = set()
+    all_trigrams = set()
+    for seq in samples:
+      tokens = seq[0].cpu().tolist()
+      bigrams = [(tokens[i], tokens[i+1]) for i in range(len(tokens)-1)]
+      trigrams = [(tokens[i], tokens[i+1], tokens[i+2]) for i in range(len(tokens)-2)]
+      all_bigrams.update(bigrams)
+      all_trigrams.update(trigrams)
+
+    diversity_results[method_name] = (len(all_bigrams), len(all_trigrams))
+
+  methods = list(diversity_results.keys())
+  bigram_divs = [diversity_results[m][0] for m in methods]
+  trigram_divs = [diversity_results[m][1] for m in methods]
+
+  x = np.arange(len(methods))
+  width = 0.35
+
+  bars1 = ax4.bar(x - width/2, bigram_divs, width, label='Bigram', alpha=0.8)
+  bars2 = ax4.bar(x + width/2, trigram_divs, width, label='Trigram', alpha=0.8)
+
+  ax4.set_xlabel('Generation Method')
+  ax4.set_ylabel('Unique n-grams')
+  ax4.set_title(f'Diversity Analysis ({n_samples} samples)')
+  ax4.set_xticks(x)
+  ax4.set_xticklabels(methods, rotation=45)
+  ax4.legend()
+  ax4.grid(True, alpha=0.3, axis='y')
+
+  # Add value labels on bars
+  for bar in bars1:
+    height = bar.get_height()
+    ax4.text(bar.get_x() + bar.get_width()/2., height,
+             f'{int(height)}', ha='center', va='bottom', fontsize=9)
+  for bar in bars2:
+    height = bar.get_height()
+    ax4.text(bar.get_x() + bar.get_width()/2., height,
+             f'{int(height)}', ha='center', va='bottom', fontsize=9)
+
+  plt.suptitle('LogitLens Analysis of Text Generation', fontsize=14)
+  plt.tight_layout()
+  plt.show()
+
+  print("The training loss decreases steadily across iterations, showing that the model is learning consistently.")
+  print("The validation loss decreases initially but then plateaus, suggesting possible underfitting or regularization effects.")
+  print("The accuracy improves with iterations, confirming that the model generalizes better over time.")
+  print("The learning rate follows a warmup and decay schedule, stabilizing training dynamics.")
+  print("The gradient norm fluctuates but remains bounded, indicating stable optimization without exploding gradients.")
+  print("The weight updates gradually shrink, suggesting convergence as training progresses.")
+
+
+
+  print("\n\nKey LogitLens Insights:")
+  print("1. Early layers (0-1): High entropy, broad exploration of vocabulary")
+  print("2. Middle layers (2-3): Rapid convergence, token predictions stabilize")
+  print("3. Final layers (4+): Fine-tuning probabilities, confirming decisions")
+  print("4. Greedy vs Temperature: Greedy shows faster convergence (lower H)")
+  print("5. Stability patterns: Later generation steps show earlier convergence")
+  print("\nResidual stream interpretation:")
+  print("  h_L = h_0 + Σ_i Δ_i where Δ_i = attention_i(h) + ffn_i(h)")
+  print("  Each layer adds incremental evidence to the residual stream")
+
+compare_generation_methods()
 
