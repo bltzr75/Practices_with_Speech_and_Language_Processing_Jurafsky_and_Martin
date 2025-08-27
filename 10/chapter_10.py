@@ -283,3 +283,405 @@ print(f"\nGenerated: {generated}")
 
 print("\nNote: Have to do the benchmark with longer sequences or multiple prompts to see real gains.")
 
+"""# Sampling Methods"""
+
+def apply_temperature(logits:np.ndarray, temperature:float) -> np.ndarray:
+  """
+  Applying temperature for scaling logits: y= softmax (u/τ)
+  τ (tau) is the temperature: the closer to 0 more deterministic (more peak/lower entropy in the distrib) while higher than one flattens (higher entropy) all the distribution
+  The name comes from thermodynamics were hotter systems are more likely to explore new states and colder are the opposite
+  """
+
+  if temperature == 0: # argmax, deterministic
+    probs = np.zeros_like(logits)
+    probs[np.argmax(logits)] = 1.0
+    return(probs)
+
+  # Scaling by temp
+  scaled_logits = logits/temperature # u/τ
+  print(f"Temperature {temperature}: logits range [{logits.min():.2f}, {logits.max():.2f}] -> [{scaled_logits.min():.2f}, {scaled_logits.max():.2f}]")
+
+  # Apply softmax: exp(ui/τ) / Σ exp(uj/τ)
+  exp_logits = np.exp(scaled_logits - np.max(scaled_logits)) # a diff scaling but for numerical stability  before softmax, preventing overflow of large values without chaning the softmax probs, benefits numerical predcision also
+  probs = exp_logits / np.sum(exp_logits) # normalize to sum up to 1
+  return(probs)
+
+def top_k_sampling(logits: np.ndarray, k:int) -> np.ndarray:
+  """
+  Take the k top most probable, cut-off the rest and normalize only for those k tokens and then sample with the new probs
+  Cons: k is a constant so inside those inside those k there could be very unlikely words, that's where top-p works better
+  """
+
+  probs = np.exp(logits - np.max(logits)) # numerical stability and prevent overflow. # np.max(array) → returns the largest value; np.argmax(array) → returns the index of the largest value.
+  probs = probs / np.sum(probs) # softmax
+
+  # top-k indices
+  top_k_indices = np.argpartition(probs, -k)[-k:] # Indices of top k values. argpartition perform an indirect partition along the given axis using the algorithm specified by the kind keyword. It returns an array of indices of the same shape as a that index data along the given axis in partitioned order
+  print(f"Top-{k} indices: {sorted(top_k_indices)}")
+
+  # Create truncated distrib
+  truncated_probs = np.zeros_like(probs)
+  truncated_probs[top_k_indices] = probs[top_k_indices] # there rest are 0 but those specific indices
+  truncated_probs = truncated_probs / np.sum(truncated_probs) # renormalizing
+
+  print(f"Original entropy: {-np.sum(probs * np.log(probs + 1e-10)):.3f}")
+  print(f"Top-{k} entropy: {-np.sum(truncated_probs * np.log(truncated_probs + 1e-10)):.3f}")
+  return truncated_probs
+
+def top_p_sampling(logits: np.ndarray, p:float) -> np.ndarray:
+  """
+  Nucleus sampling: keep smallest set with the cumulative prob >= p
+  Does nt depend on a constant k like top-k
+  """
+
+  probs = np.exp(logits - np.max(logits))  # np.max(array) → returns the largest value; np.argmax(array) → returns the index of the largest value.
+  probs = probs / np.sum(probs)
+
+  # Sort probs desc
+  sorted_indices = np.argsort(probs)[::-1] # get indices that would sort the array in a descending order
+  sorted_probs = probs[sorted_indices]
+
+  # find cutoff
+  cumsum = np.cumsum(sorted_probs) # Cumulative sum. returns a new array holding the result is returned unless out is specified
+  cutoff_idx = np.searchsorted(cumsum, p) + 1  # +1 ensures that the token where the cumulative probability first exceeds p is included. Searchsorted finds indices where elements should be inserted to maintain order
+  print(f"Top-p={p}: keeping {cutoff_idx} tokens (out of {len(probs)})")
+
+  # Keep only tokens in the nucleus
+  nucleus_indices = sorted_indices[:cutoff_idx]
+  truncated_probs = np.zeros_like(probs)
+  truncated_probs[nucleus_indices] = probs[nucleus_indices] # the rest are zero
+  truncated_probs = truncated_probs / np.sum(truncated_probs) # normalize over the sum of top-p probs, which is not just p because the last can exceed the p threshold (+1 above)
+
+  print(f"Nucleus covers {np.sum(probs[nucleus_indices]):.3f} of probability mass")
+
+  return(truncated_probs)
+
+"""## Demonstrate all sampling methods
+
+"""
+
+vocab_size = 50
+logits = np.random.randn(vocab_size) * 2  # Random logits
+
+print("Original logits statistics:")
+print(f"Shape: {logits.shape}, Mean: {logits.mean():.3f}, Std: {logits.std():.3f}\n")
+
+# Visualize different sampling strategies
+fig, axes = plt.subplots(3, 3, figsize=(15, 12))  # 3 rows now: temp, top-k, top-p
+
+# Temperature sampling
+for i, temp in enumerate([0.5, 1.0, 2.0]):
+    probs = apply_temperature(logits, temp)
+    axes[0, i].bar(range(vocab_size), probs)
+    axes[0, i].set_title(f'Temperature τ={temp}')
+    axes[0, i].set_ylabel('Probability')
+    axes[0, i].axhline(y=1/vocab_size, color='r', linestyle='--', alpha=0.5, label='uniform')
+    axes[0, i].text(0.5, 0.95, f'Max p={np.max(probs):.3f}', transform=axes[0, i].transAxes)
+
+# Top-k sampling
+for i, k in enumerate([5, 10, 20]):
+    probs = top_k_sampling(logits, k)
+    axes[1, i].bar(range(vocab_size), probs)
+    axes[1, i].set_title(f'Top-{k} Sampling')
+    axes[1, i].set_ylabel('Probability')
+    axes[1, i].set_xlabel('Token ID')
+    axes[1, i].text(0.5, 0.95, f'{np.sum(probs>0)} active tokens', transform=axes[1, i].transAxes)
+
+# Top-p (nucleus) sampling
+for i, p in enumerate([0.6, 0.8, 0.95]):
+    probs = top_p_sampling(logits, p)
+    axes[2, i].bar(range(vocab_size), probs)
+    axes[2, i].set_title(f'Top-p={p} Sampling')
+    axes[2, i].set_ylabel('Probability')
+    axes[2, i].set_xlabel('Token ID')
+    axes[2, i].text(0.5, 0.95, f'{np.sum(probs>0)} active tokens', transform=axes[2, i].transAxes)
+
+plt.tight_layout()
+plt.show()
+
+"""# Training with Self-Supervision & Teacher Forcing"""
+
+class AutoregressiveLM(nn.Module):
+  """Basic autoregressive lang model for training"""
+
+  def __init__(self, vocab_size: int, d_model:int, context_length:int):
+    super().__init__()
+
+    self.vocab_size = vocab_size
+    self.d_model = d_model
+    self.context_length = context_length
+
+    # Embeddings [vocab_size, d_model]
+    self.token_embedding = nn.Embedding(vocab_size, d_model)
+    self.position_embedding = nn.Embedding(context_length, d_model)
+
+    # Simple transformer block
+    self.attention = nn.MultiheadAttention(
+        d_model,
+        num_heads=4,
+        batch_first=True) # Changes the order of input output arguments expected.  batch_first: If True, then the input and output tensors are provided as (batch, seq, feature). Default: False (seq, batch, feature).
+
+    # Standard practice for the feedforward hidden size d_ffn ≈ 4 × d_model
+    self.ffn = nn.Sequential(
+        nn.Linear(d_model, d_model * 4), # args: in_features: int, out_features: int,
+        nn.ReLU(),
+        nn.Linear(d_model * 4, d_model)
+    )
+
+    self.ln1 = nn.LayerNorm(d_model)
+    self.ln2 = nn.LayerNorm(d_model)
+
+    # Lang model head  (unembedding matrix)
+    self.lm_head = nn.Linear(d_model,vocab_size, bias=False)
+    print(f"Model initialized: vocab={vocab_size}, d_model={d_model}, context={context_length}")
+    print(f"Parameters: {sum(p.numel() for p in self.parameters()):,}")
+
+
+  def forward(self,
+              idx: torch.Tensor,
+              targets: Optional[torch.Tensor]=None):
+    """
+    Forward pass with Teacher Forcing
+    idx: [batch, seq_len] token indices
+    targets: [batch,seq_len] next token targets for training
+    """
+
+    B, T = idx.shape # batch size and sequence length
+
+    # Token + position embedding
+    tok_emb = self.token_embedding(idx) # [B, T, d_model] used Batch = True when defining
+    pos = torch.arange(T, device = idx.device) # position indices [0,1..., T-1]
+    pos_emb = self.position_embedding(pos) # [T, d_model]
+    x = tok_emb + pos_emb # [B, T, d_model] Broadcasting position embeddings
+
+    print(f"Embeddings: tok_emb {tok_emb.shape} + pos_emb {pos_emb.shape} = {x.shape}")
+
+
+    # Mask for attn
+    mask = torch.triu(torch.ones(T,T), diagonal=1).bool() # Upper triangular
+
+    # Self-Attention block
+    attn_out, _ = self.attention(x, x, x , attn_mask = mask) # applies attn to Q, K, V, with upper mask
+
+    x = x + attn_out # Resid conneciotn
+    x = self.ln1(x) # postnorm
+
+    # Feedforward block
+    ffn_out = self.ffn(x) # [B, T, d_model]
+    x = x + ffn_out # Residual conn
+    x = self.ln2(x) # post norm, prenorm would be bfr the resid connection
+
+    logits = self.lm_head(x) # Unembedding matrix [B,T, vocab_size]
+    print(f"Logits: {logits.shape}, range: [{logits.min():.2f}, {logits.max():.2f}]")
+
+    loss = None
+    if targets is not None:
+      # Compute CE Loss for the Lang Modeling
+      logits_flat = logits.view(-1, self.vocab_size) # [B,T, vocab_size] -> [B*T, vocab_size]  flatten the batch and sequence dimensions into a single dimension while keeping the vocabulary dimension intact. -1 is a placeholder that tells PyTorch to automatically infer that dimension so that the total number of elements stays the same
+      targets_flat = targets.contiguous().view(-1)  # [B,T] ->[B*T] - flatten to 1D . view(-1) requires the tensor to be contiguous in memory, other options is reshape(-1) which does not require that
+
+      # Cross-entropy: -Σ y_true * log(y_pred)
+      loss = F.cross_entropy(logits_flat, targets_flat)
+      print(f"Loss computation: logits {logits_flat.shape} vs targets {targets_flat.shape} = {loss:.4f}")
+
+    return logits, loss
+
+def train_step(model: nn.Module, data: torch.Tensor, optimizer: torch.optim.Optimizer):
+  """Single training step with teacher forcing"""
+
+  # Prepare input and targets
+  inputs = data[:, :-1] # All but last token
+  targets = data[:, 1:] # All but first token
+
+  print(f"\nTeacher forcing setup:")
+  print(f"Input sequence:  {inputs[0].tolist()}")
+  print(f"Target sequence: {targets[0].tolist()}")
+  print(f"Teaching model: predict token[i+1] from tokens[0:i+1]")
+
+  # Forward pass
+  logits, loss = model(inputs, targets)
+
+  # Backward pass
+  optimizer.zero_grad() # resetting before computing grads to not accum prev
+  loss.backward()
+
+  # Gradient stats
+  total_norm = 0
+  for p in model.parameters():
+    if p.grad is not None:
+      param_norm = p.grad.norm(2).item() # L2 / Ridge Norm of the gradient
+      total_norm += param_norm ** 2
+
+  total_norm = total_norm ** 0.5
+  print(f"Gradient norm: {total_norm:.4f}")
+
+  optimizer.step()
+  return loss.item()
+
+"""### Simple Test
+
+"""
+
+# Small model and training
+vocab_size = 100
+d_model = 64
+context_length =16
+batch_size = 4
+seq_len = context_length
+
+model = AutoregressiveLM(vocab_size, d_model, context_length)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+
+# Generate random data
+data = torch.randint(0, vocab_size, (batch_size, seq_len + 1))  # +1 for targets
+print("Generated Random Data:")
+print(data)
+print(f"\nTraining data shape: {data.shape}")
+# Training loop
+losses = []
+for step in range(5):
+  loss = train_step(model, data, optimizer)
+  losses.append(loss)
+  print(f"\nStep {step}: Loss = {loss:.4f}")
+
+print(f"\nLoss trajectory: {losses}")
+
+"""#Fine-tuning: LoRA"""
+
+class LoRALinear(nn.Module):
+  """Linear layer with LoRA"""
+
+  def __init__(self, in_features:int, out_features:int, rank: int=4, alpha:float=1.0):
+    super().__init__()
+
+    self.in_features = in_features
+    self.out_features = out_features
+    self.rank = rank
+    self.alpha = alpha
+
+    # Frozen pretrained weights
+    self.weight = nn.Parameter(torch.randn(out_features, in_features)*0.02)
+    self.weight.requires_grad = False # Freeze pretrained weights
+
+    # LoRA parameters (trainable)
+    self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.02) # [r,in]
+    self.lora_B = nn.Parameter(torch.zeros(out_features, rank) * 0.02) # [out, r]  init to zero
+
+    # Scaling factor
+    self.scaling = alpha / rank
+
+    print(f"LoRA Linear layer: [{in_features}] -> [{out_features}]")
+    print(f"  Pretrained W: {self.weight.shape} = {self.weight.numel():,} params (frozen)")
+    print(f"  LoRA A: {self.lora_A.shape} = {self.lora_A.numel():,} params")
+    print(f"  LoRA B: {self.lora_B.shape} = {self.lora_B.numel():,} params")
+    print(f"  Total trainable: {self.lora_A.numel() + self.lora_B.numel():,}")
+    print(f"  Compression: {self.weight.numel() / (self.lora_A.numel() + self.lora_B.numel()):.1f}x")
+
+
+  def forward(self, x:torch.Tensor) -> torch.Tensor:
+    """Forward pass: h = x(W + BA * scaling)"""
+
+    # Original computation: x @ W^T
+    out_frozen = F.linear(x, self.weight)
+
+
+    # LoRA computation:     x @ A^T @ B^T * scaling
+    out_lora = x @ self.lora_A.T @ self.lora_B.T * self.scaling
+    # x @ lora_A.T → [batch, seq, in] @ [in, rank] = [batch, seq, rank]
+    # (x @ lora_A.T) @ lora_B.T → [batch, seq, rank] @ [rank, out] = [batch, seq, out]
+
+    print(f"\nLoRA forward pass:")
+    print(f"  Input: x {x.shape}")
+    print(f"  Frozen path: x {x.shape} @ weight.T {self.weight.T.shape} = out_frozen {out_frozen.shape}")
+    print(f"  LoRA path: x {x.shape} @ lora_A.T {self.lora_A.T.shape} @ self.lora_B.T {self.lora_B.T.shape} = out_lora {out_lora.shape}")
+    print(f"  LoRA contribution norm: out_lora.norm {out_lora.norm():.4f}")
+
+    return out_frozen + out_lora  # During inference, the output becomes h = xW + xAB (instead of the forward pass h = xW)
+
+"""## Compare standard vs LoRA fine-tuning
+
+"""
+
+def count_parameters(model: nn.Module) -> Tuple[int, int]:
+  """Count total and trainable parameters"""
+  total = sum(p.numel() for p in model.parameters())
+  trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  return total, trainable
+
+# Standard linear layer
+standard_linear = nn.Linear(512, 512)
+total_std, trainable_std = count_parameters(standard_linear)
+print(f"Standard Linear: {total_std:,} total, {trainable_std:,} trainable\n")
+
+# LoRA linear layer
+lora_linear = LoRALinear(512, 512, rank=8)
+total_lora, trainable_lora = count_parameters(lora_linear)
+print(f"\nLoRA Linear: {total_lora:,} total, {trainable_lora:,} trainable")
+print(f"Parameter reduction: {(1 - trainable_lora/trainable_std)*100:.1f}%\n")
+
+# Test forward pass
+x = torch.randn(4, 16, 512)  # [batch, seq_len, features]
+out_standard = standard_linear(x)
+out_lora = lora_linear(x)
+
+print(f"\nOutput shapes match: {out_standard.shape} == {out_lora.shape}\n")
+
+"""#Transformer with LoRA"""
+
+class LoRATransformer(nn.Module):
+  """Transformar with LoRA on attention layers"""
+
+  def __init__(self, d_model: int, n_heads: int, lora_rank:int=4):
+    super().__init__()
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.d_head = d_model // n_heads
+
+    # Replace standard projections with LoRA versions
+    self.q_proj = LoRALinear(d_model, d_model, rank=lora_rank)
+    self.k_proj = LoRALinear(d_model, d_model, rank=lora_rank)
+    self.v_proj = LoRALinear(d_model, d_model, rank=lora_rank)
+    self.o_proj = LoRALinear(d_model, d_model, rank=lora_rank)
+
+    total, trainable = count_parameters(self)
+    print(f"\nLoRA Transformer initialized:")
+    print(f"  Total parameters: {total:,}")
+    print(f"  Trainable parameters: {trainable:,} ({trainable/total*100:.1f}%)")
+
+
+  def forward(self, x:torch.Tensor) -> torch.Tensor:
+    B,L,D = x.shape
+    print("\ninput x shape: ", x.shape, "\n")
+
+    # Project to Q,K,V with LoRA
+    Q = self.q_proj(x).view(B,L,self.n_heads, self.d_head).transpose(1,2)
+    K = self.k_proj(x).view(B,L,self.n_heads, self.d_head).transpose(1,2)
+    V = self.v_proj(x).view(B,L,self.n_heads, self.d_head).transpose(1,2)
+
+
+    # Standard attention computation
+    scores = torch.matmul(Q,K.transpose(-2,-1)) / math.sqrt(self.d_head)
+    attn = F.softmax(scores,dim=-1)
+    out = torch.matmul(attn,V)
+
+
+    # Reshape and output projection
+    out = out.transpose(1,2).contiguous().view(B,L,D) # Reshaped to input shape back. Using contiguous for memory layout
+    out = self.o_proj(out)
+
+    return out
+
+"""## Testing LoRA transformer
+
+"""
+
+lora_transformer = LoRATransformer(d_model=256, n_heads=8, lora_rank=4)
+x = torch.randn(2, 32, 256)
+output = lora_transformer(x)
+print(f"\nLoRA Transformer output: {output.shape}")
+
+"""#Fine-tuning: PEFT with HuggingFace & bitsandbytes"""
+
+
+
