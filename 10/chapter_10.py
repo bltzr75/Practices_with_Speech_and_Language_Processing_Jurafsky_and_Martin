@@ -89,7 +89,7 @@ class SimpleLanguageModel:
 
       context.append(next_token) # Starts from the prompt/context and keeps generating increasing it
 
-      return(context)
+    return(context)
 
 """##Simple Test"""
 
@@ -145,6 +145,10 @@ class OptimizedLanguageModel(nn.Module):
     mask = torch.triu(torch.ones(T,T,device=idx.device),diagonal=1).bool()
     x, _ = self.attention(x,x,x, attn_mask=mask) # scaled dot-product attention mechanism: [Q, K,V]
 
+    # Layer Norm
+    x = self.ln(x)
+
+    # Unembedding
     logits = self.lm_head(x) # [B, T, vocab_size]
 
     return(logits)
@@ -566,7 +570,7 @@ class LoRALinear(nn.Module):
 
     # LoRA parameters (trainable)
     self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.02) # [r,in]
-    self.lora_B = nn.Parameter(torch.zeros(out_features, rank) * 0.02) # [out, r]  init to zero
+    self.lora_B = nn.Parameter(torch.zeros(out_features, rank)) # [out, r]  init to zero
 
     # Scaling factor
     self.scaling = alpha / rank
@@ -683,5 +687,181 @@ print(f"\nLoRA Transformer output: {output.shape}")
 
 """#Fine-tuning: PEFT with HuggingFace & bitsandbytes"""
 
+from peft import LoraConfig, get_peft_model, TaskType # Hugging Face Parameter Efficient Fine-Tuning utilities
+import bitsandbytes as bnb # 8-bit iptimization lib
 
+class LoRA8bit(nn.Module):
+  """
+  Low Rank Adaptation:  W + BA where d (dim emb) approaches r (rank)
+    Allows for 175B models on a single GPU
+    100-1000x fewer params
+
+  bitsandbytes: 8bit quantization for memory efficiency
+  """
+
+  def __init__(self, in_features: int, out_features:int, r:int =8,
+               alpha:float = 32, use_8bit:bool = False):
+    super().__init__()
+
+    self.r = r
+    self.alpha = alpha
+    self.scaling = alpha / r
+
+    # Frozen base weight
+    self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+    self.weight.requires_grad = False  # Freeze pretrained weights
+
+    # LoRA matrices
+    self.lora_A = nn.Parameter(torch.randn(r, in_features) * 0.02)
+    self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+
+    self.use_8bit = use_8bit and torch.cuda.is_available()
+
+    print(f"LoRA: {in_features}->{out_features} (rank={r})")
+    print(f"  Compression: {self.weight.numel() / (self.lora_A.numel() + self.lora_B.numel()):.1f}x")
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    base_out = F.linear(x, self.weight) # Standar computation
+
+    # LoRA computation:     x @ A^T @ B^T * scaling
+    lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling  # Lora computation
+    # x @ lora_A.T → [batch, seq, in] @ [in, rank] = [batch, seq, rank]
+    # (x @ lora_A.T) @ lora_B.T → [batch, seq, rank] @ [rank, out] = [batch, seq, out]
+
+    return base_out + lora_out # During inference, the output becomes h = xW + xAB (instead of the forward pass h = xW)
+
+def create_peft_config(r:int = 8, alpha:int=32, target_modules:List[str] = None ) -> LoraConfig:
+  """PEFT Config for Hugging Face models"""
+
+  if target_modules is None:
+    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+  config = LoraConfig(
+      r = r, # lora rank
+      lora_alpha = alpha, # lora scaling
+      target_modules = target_modules, # on which layers apply lora
+      lora_dropout= 0.1, # dropuout for the lora layers
+      bias = "none", # not training biases
+      task_type=TaskType.CAUSAL_LM ## Define the adaptor task as Language Modelling
+  )
+  print(f"PEFT Config: r={r}, alpha={alpha}, scaling={alpha/r}")
+
+  return config
+
+"""## Compare efficiency
+
+"""
+
+class FullModel(nn.Module):
+  def __init__(self, vocab_size:int, d_model:int):
+    super().__init__()
+    self.embedding = nn.Embedding(vocab_size, d_model)
+    self.transformer = nn.TransformerEncoderLayer(d_model, nhead=8, batch_first=True )
+    self.lm_head = nn.Linear(d_model, vocab_size)
+
+class LoRAModel(nn.Module):
+  def __init__(self, vocab_size:int, d_model:int, r:int = 8):
+    super().__init__()
+
+    self.embedding = nn.Embedding(vocab_size, d_model)
+    self.embedding.weight.requires_grad = False
+
+    self.q_proj = LoRA8bit(d_model, d_model, r=r)  # LoRA for Q projection
+    self.k_proj = LoRA8bit(d_model, d_model, r=r)  # LoRA for K projection
+    self.v_proj = LoRA8bit(d_model, d_model, r=r)  # LoRA for V projection
+    self.o_proj = LoRA8bit(d_model, d_model, r=r)  # LoRA for output projection
+
+    self.lm_head = nn.Linear(d_model, vocab_size)
+    self.lm_head.weight.requires_grad = False
+
+d_model = 768
+vocab_size = 50257
+
+full_model = FullModel(vocab_size, d_model)
+lora_model = LoRAModel(vocab_size, d_model, r=8)
+
+def count_parameters(model):
+  total = sum(p.numel() for p in model.parameters())
+  trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  return total, trainable
+
+full_total, full_trainable = count_parameters(full_model)
+lora_total, lora_trainable = count_parameters(lora_model)
+
+print("\nParameter Efficiency:")
+print(f"Full: {full_trainable:,} trainable")
+print(f"LoRA: {lora_trainable:,} trainable")
+print(f"Reduction: {(1 - lora_trainable/full_trainable)*100:.1f}%")
+
+def train_with_8bit_adam(model: nn.Module, train_loader, num_steps: int = 10):
+  """8-bit Adam: 75% less optimizer memory"""
+
+  lora_params = [p for n, p in model.named_parameters() if 'lora' in n and p.requires_grad]
+
+  if torch.cuda.is_available() and hasattr(bnb.optim, 'Adam8bit'):
+    optimizer = bnb.optim.Adam8bit(lora_params, lr=3e-4)  # 8-bit Adam optimizer
+    print("Using 8-bit Adam")
+  else:
+    optimizer = torch.optim.AdamW(lora_params, lr=3e-4)
+    print("Using standard AdamW")
+
+  model.train()
+
+  for step, batch in enumerate(train_loader):
+    if step >= num_steps:
+      break
+
+    # FIX: Unpack the batch from the list
+    batch = batch[0]  # Extract tensor from list
+    batch = batch.to(device)
+    embeddings = model.embedding(batch)
+
+    q = model.q_proj(embeddings)  # Apply LoRA to Q
+    k = model.k_proj(embeddings)  # Apply LoRA to K
+    v = model.v_proj(embeddings)  # Apply LoRA to V
+
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_model)
+    attn = F.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)
+    out = model.o_proj(out)  # Apply LoRA to output
+
+    loss = out.mean()
+
+    optimizer.zero_grad()
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(lora_params, max_norm=1.0)
+    optimizer.step()
+
+    if step % 2 == 0:
+      print(f"Step {step}: Loss={loss.item():.4f}")
+
+"""## Training"""
+
+lora_model = lora_model.to(device)
+
+dummy_loader = torch.utils.data.DataLoader(
+  torch.utils.data.TensorDataset(torch.randint(0, vocab_size, (100, 32))),
+  batch_size=4
+)
+
+train_with_8bit_adam(lora_model, dummy_loader, num_steps=10)
+
+"""## Memory analysis
+
+"""
+
+print("\nMemory Footprint:")
+
+def get_model_memory(model):
+  param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+  grad_bytes = sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+  optimizer_bytes = grad_bytes * 2  # Adam momentum + variance
+  return param_bytes, grad_bytes, optimizer_bytes
+
+full_p, full_g, full_o = get_model_memory(full_model)
+lora_p, lora_g, lora_o = get_model_memory(lora_model)
+
+print(f"Full: {(full_g + full_o)/1024**2:.2f} MB (grad+opt)")
+print(f"LoRA: {(lora_g + lora_o)/1024**2:.2f} MB (grad+opt)")
+print(f"Memory saved: {(1 - (lora_g + lora_o)/(full_g + full_o))*100:.1f}%")
 
