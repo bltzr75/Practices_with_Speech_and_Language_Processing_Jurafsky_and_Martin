@@ -185,6 +185,10 @@ class BidirectionalAttention:
   def __init__(self, d_model:int, n_heads:int):
     self.d_model = d_model
     self.n_heads = n_heads
+
+    assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+
+
     self.d_head = d_model//n_heads
 
     # Weight matrices
@@ -205,8 +209,8 @@ class BidirectionalAttention:
 
     # Compute Q, K, V
     Q = x @ self.W_Q # [seq_len, d_model]
-    K = x @ self.K_Q # [seq_len, d_model]
-    V = x @ self.V_Q # [seq_len, d_model]
+    K = x @ self.W_K # [seq_len, d_model]
+    V = x @ self.W_V # [seq_len, d_model]
     print(f"\nQ,K,V shapes: {Q.shape}")
 
     # Reshape for the multi-head, needs [L, h, d_k]
@@ -215,8 +219,275 @@ class BidirectionalAttention:
     V = V.reshape(seq_len, self.n_heads, self.d_head)
 
     # Compute attention without causal masking
-    scores = np.zeros(self.n_heads, seq_len, seq_len)
+    scores = np.zeros((self.n_heads, seq_len, seq_len))
 
     for head in range(self.n_heads):
       QK = Q[:, head] @ K[:,head].T # [L, d_k] @ [d_k, L] = [L, L]
+      scores[head] = QK / np.sqrt(self.d_head) # normalization by sqrt of d_k
+      print(f"Head {head}: QK^T range [{QK.min():.2f}, {QK.max():.2f}]")
+
+
+    # Without Masking
+    # Sofmax directly
+    attention = np.exp(scores - scores.max(axis=-1, keepdims=True)) # Stability and avoid overflow for large values
+    attention = attention / attention.sum(axis=-1, keepdims=True)
+    print(f"Attention shape: {attention.shape}, no causal mask applied")
+
+    # Attention to Values Matrix
+    output = np.zeros((seq_len, self.d_model))
+    for head in range(self.n_heads):
+      head_out = attention[head] @ V[:,head] # [L, L] @ [L, d_k] = [L, d_k]
+      start_idx = head * self.d_head
+      end_idx = (head+1) * self.d_head
+      output[:, start_idx :end_idx] = head_out
+
+    # Output Proj
+    output = output @ self.W_O
+    print(f"Output shape: {output.shape}")
+
+    return output, attention.mean(axis=0) # Average attention over heads
+
+"""## Test Bidirectional vs Causal"""
+
+seq_len, d_model = 6, 64
+x = np.random.randn(seq_len, d_model)
+
+bidirectional_attn = BidirectionalAttention(d_model, n_heads=4)
+output, attn_weights = bidirectional_attn.forward(x)
+
+
+# Visualize bidirectional attention pattern
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+plt.imshow(attn_weights, cmap='Blues')
+plt.colorbar()
+plt.title('Bidirectional Attention\n(can attend to all positions)')
+plt.xlabel('Keys')
+plt.ylabel('Queries')
+
+# Show causal mask for comparison
+plt.subplot(1, 2, 2)
+causal_mask = np.tril(np.ones((seq_len, seq_len)))
+plt.imshow(causal_mask, cmap='Blues')
+plt.colorbar()
+plt.title('Causal Mask Pattern\n(only attend to past)')
+plt.xlabel('Keys')
+plt.ylabel('Queries')
+plt.tight_layout()
+plt.show()
+
+print(f"\nKey difference: Position 0 can attend to position 5: {attn_weights[0, 5]:.3f}")
+print(f"In causal attention, this would be 0 (masked)")
+
+"""#PyTorch Bidirectional Transformer Block"""
+
+class BidirectionalTransformerBlock(nn.Module):
+  """BERT-style transformer block without causal masking"""
+
+  def __init__(self, d_model: int, n_heads: int, d_ff: int = None, dropout:float = 0.1):
+    super().__init__()
+
+    self.d_model = d_model
+    self.n_heads = n_heads
+
+    # Multi-head attention wihout maskin
+    self.attention = nn.MultiheadAttention(self.d_model, n_heads, dropout=dropout, batch_first=True)
+
+    # Feedforward Layer
+    d_ff = d_ff or 4 * d_model # Usually FFN = 4 * hidden state
+
+    self.ffn = nn.Sequential(
+        nn.Linear(d_model, d_ff),
+        nn.GELU(),    # Standard activation function in BERT, not ReLU
+        nn.Dropout(dropout),
+        nn.Linear(d_ff, d_model)
+        )
+
+    # Layer Norm (post-norm)
+    self.ln1 = nn.LayerNorm(d_model)
+    self.ln2 = nn.LayerNorm(d_model)
+    self.dropout = nn.Dropout(dropout)
+
+  def forward(self, x:torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    """
+    x:  [batch, seq_len, d_model]
+    padding_mask: [batch,seq_len] - True for padded positions
+    """
+    print(f"\nInput: {x.shape}")
+
+    # Self attention without Causal Mask
+    attn_out, attn_weights = self.attention(x, x, x,    # Q,K,V
+                                            key_padding_mask = padding_mask, # Shape: [batch, seq_len]. tells the attention which tokens are padding and should not contribute to the attention output. Example: padding_mask = torch.tensor([[False, False, True, True]])  # batch=1, seq_len=4
+                                            need_weights = True,  # whether the function should return the attention weights along with the output
+                                            attn_mask = None # No causal mask
+                                            )
+    print(f"Attention output: {attn_out.shape}, weights: {attn_weights.shape}")
+
+    # Residual connection + layer norm
+    x = self.ln1(x + self.dropout(attn_out))
+    print(f"After LN1: mean={x.mean():.3f}, std={x.std():.3f}")
+
+    # Feedforward
+    ffn_out = self.ffn(x)
+
+    # Residual connection + layer norm
+    x = self.ln2(x + self.dropout(ffn_out))
+    print(f"After LN2: mean={x.mean():.3f}, std={x.std():.3f}")
+
+    return x, attn_weights
+
+"""## Test with mixed precision and torch.compile"""
+
+model = BidirectionalTransformerBlock(d_model=256, n_heads=8).to(device)
+print(f"Parameters: {sum(param.numel() for param in model.parameters()):,}")
+
+# Mixed precision
+from torch.cuda.amp import autocast
+x = torch.randn(2,20,256).to(device)
+
+with autocast(dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad():
+  output, attn = model(x)
+  print(f"\nWith bfloat16: output dtype={output.dtype}")
+
+
+# Compiling
+if hasattr(torch, 'compile'):
+  model_compiled = torch.compile(model, mode='reduce-overhead') # Best option for small models
+  print("Model compiled with torch.compile")
+
+"""# HuggingFace BERT MLM Training"""
+
+@dataclass
+class BERTPretrainingBatch:
+  """Batch for BERT pretraining with MLM + NSP"""
+
+  input_ids: torch.Tensor
+  attention_mask: torch.Tensor
+  token_type_ids: torch.Tensor # segment for embeddings
+  mlm_labels: torch.Tensor
+  nsp_labels: torch.Tensor
+
+class BERTPretrainer(nn.Module):
+  """BERT model with MLM and NSP heads"""
+
+  def __init__(self, config):
+    super().__init__()
+    self.config = config
+
+    # Token embeddings + position + segment
+    self.embeddings = nn.ModuleDict({
+        'token':nn.Embedding(config['vocab_size'], config['d_model']),
+        'position': nn.Embedding(config['max_position'], config['d_model']),
+        'segment': nn.Embedding(2, config['d_model']), # 2 segments for Next Sent Pred
+    })
+
+    # Transformer blocks
+    self.blocks = nn.ModuleList([
+        BidirectionalTransformerBlock(
+            config['d_model'],
+            config['n_heads'],
+            config['d_ff']
+        ) for _ in range(config['n_layers'])
+    ])
+
+    # MLM head
+    self.mlm_head = nn.Sequential(
+        nn.Linear(config['d_model'], config['d_model']),
+        nn.GELU(),
+        nn.LayerNorm(config['d_model']),
+        nn.Linear(config['d_model'], config['vocab_size'])
+    )
+
+    # NSP head (binary classification)
+    self.nsp_head = nn.Sequential(
+        nn.Linear(config['d_model'], config['d_model']),
+        nn.Tanh(),
+        nn.Linear(config['d_model'], 2)
+    )
+
+    print(f"BERT Pretrainer initialized: {sum(p.numel() for p in self.parameters()):,} params")
+
+
+  def forward(self, batch: BERTPretrainingBatch):
+    # Combine embeddings
+    x = self.embeddings['token'](batch.input_ids)
+    positions = torch.arange(batch.input_ids.size(1), device=batch.input_ids.device)
+    x = x + self.embeddings['position'](positions)
+    x = x + self.embeddings['segment'](batch.token_type_ids)
+
+    print(f"Embeddings: {x.shape}, norm={x.norm(dim=-1).mean():.3f}")
+
+
+    # Pass through transformer blocks
+    for i, block in enumerate(self.blocks):
+      x, _ = block(x)
+      if i == 0:
+        print(f"After block {i}: {x.shape}")
+
+    # MLM prediction for all the tokens
+    mlm_logits = self.mlm_head(x) # shape [batch, seq_len, vocab_size]
+    print(f"MLM logits: {mlm_logits.shape}")
+
+    # NSP pred from [CLS] token (postion 0)
+    cls_hidden = x[:, 0] # [batch, d_model]
+    nsp_logits = self.nsp_head(cls_hidden) # [batch, 2]
+    print(f"NSP logits: {nsp_logits.shape}")
+
+    # Compute losses
+    mlm_loss = F.cross_entropy(
+        mlm_logits.view(-1, self.config['vocab_size']),
+        batch.mlm_labels.view(-1),
+        ignore_index = -100
+    )
+
+    nsp_loss = F.cross_entropy(nsp_logits, batch.nsp_labels)
+    total_loss = mlm_loss + nsp_loss
+    print(f"MLM loss: {mlm_loss:.3f}, NSP loss: {nsp_loss:.3f}, Total: {total_loss:.3f}")
+
+
+    return {'loss': total_loss, 'mlm_loss': mlm_loss, 'nsp_loss': nsp_loss}
+
+"""### Combined training test"""
+
+config = {
+  'vocab_size': 1000,
+  'd_model': 256,
+  'n_heads': 8,
+  'd_ff': 1024,
+  'n_layers': 2,
+  'max_position': 128
+}
+
+
+model = BERTPretrainer(config).to(device)
+
+# Create dummy batch
+batch = BERTPretrainingBatch(
+  input_ids=torch.randint(0, 1000, (4, 32)).to(device),
+  attention_mask=torch.ones(4, 32).to(device),
+  token_type_ids=torch.cat([torch.zeros(4, 16), torch.ones(4, 16)], dim=1).long().to(device),
+  mlm_labels=torch.full((4, 32), -100).to(device),
+  nsp_labels=torch.randint(0, 2, (4,)).to(device)
+)
+
+# Set some MLM labels
+batch.mlm_labels[:, [5, 10, 15]] = torch.randint(0, 1000, (4, 3)).to(device)
+
+# Forward pass with gradient accumulation
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+for step in range(2):
+  print(f"\nStep {step}:")
+  output = model(batch)
+  loss = output['loss'] / 2  # Gradient accumulation
+  loss.backward()
+
+  if step % 2 == 1:  # Accumulate 2 steps
+    optimizer.step()
+    optimizer.zero_grad()
+    print("Weights updated after gradient accumulation")
+
+
+
+
 
