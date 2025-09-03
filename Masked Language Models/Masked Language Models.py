@@ -409,6 +409,7 @@ class BERTPretrainer(nn.Module):
 
 
   def forward(self, batch: BERTPretrainingBatch):
+
     # Combine embeddings
     x = self.embeddings['token'](batch.input_ids)
     positions = torch.arange(batch.input_ids.size(1), device=batch.input_ids.device)
@@ -441,6 +442,8 @@ class BERTPretrainer(nn.Module):
     )
 
     nsp_loss = F.cross_entropy(nsp_logits, batch.nsp_labels)
+
+
     total_loss = mlm_loss + nsp_loss
     print(f"MLM loss: {mlm_loss:.3f}, NSP loss: {nsp_loss:.3f}, Total: {total_loss:.3f}")
 
@@ -487,7 +490,112 @@ for step in range(2):
     optimizer.zero_grad()
     print("Weights updated after gradient accumulation")
 
+"""# Contextual Embeddings and Anisotropy Computation"""
+
+class ContextualEmbeddingExtractor:
+  """Extract and analyze contexttual embeddings"""
+
+  def __init__(self, n_layers: int, d_model: int):
+    self.n_layers = n_layers
+    self.d_model = d_model
+
+  def extract_token_embeddings(self, hidden_states: List[np.ndarray], layer_indices: List[int] = None) -> np.ndarray:
+    """
+    Extract contextual embeddings from specified layers
+    hidden_states: List of [seq_len, d_model] arrays from each layer
+    """
+
+    if layer_indices is None:
+      # Defualt: using the average of the 4 last layers (common for bert), this creates a more robust representation, leveraging the hierarchical nature of the transformer representation, where diff layers capture diff semantic and linguistic properties :)
+      layer_indices = list(range(max(0, len(hidden_states) -4), len(hidden_states)))
+
+    print(f"Extracting from layers: {layer_indices}")
+
+    # Stack selected layers
+    selected = [hidden_states[i] for i in layer_indices]
+    stacked = np.stack(selected, axis=0) # [n_layers, seq_len, d_model]
+    print(f"Stacked shape: {stacked.shape}")
 
 
+    # Average across layers
+    avg_embedding = stacked.mean(axis=0) # [seq_len, d_model]
+    print(f"Averaged embedding: {avg_embedding.shape}")
 
+    return avg_embedding
+
+
+  def compute_anisotropy(self, embeddings: np.ndarray) -> float:
+    """
+    Compute anisotropy (average cosine simiarity between random pairs)
+    High anisotropy is the same as having the vectors pointing to the same direction in embeding space.
+    Having isotropy instead is what we need, so that the vectors are pointing in all the directions, and not a single one (a single token).
+    Anisotropy occurs bcs in all the embeddings there are always some few dimensions that dominate and for which every token will have a very high value, so they end up pointing to similar points
+    The solution is to standardize the embeddings: substract the mean and divide by the stdev
+    """
+
+    n_samples = min(100, len(embeddings))
+    indices= np.random.choice(len(embeddings), n_samples, replace=False)
+    sampled = embeddings[indices] # extracted the sampled embeddings
+
+    # compute pairwise cosines
+    norms = np.linalg.norm(sampled, axis=1, keepdims=True)
+
+    normalized = sampled/(norms + 1e-10) # [n_samples, d_model]
+    print("normalized: \n", normalized ,"\n")
+
+
+    # For normalized vectors, dot product = cosine similarity
+    cosine_matrix = normalized @ normalized.T  # [n_samples, n_samples]  A symmetric matrix where each entry is the cosine similarity between two vectors (diagonal = 1.0 for self-similarity).
+    print("cosine_matrix: \n", cosine_matrix ,"\n")
+
+    # Averaging off-diagonal elements
+    mask = 1 - np.eye(n_samples) # Create mask: 1s everywhere except diagonal (which has 0s). The np.eye creates identity matrix with 1s on diagonal
+    print("mask: \n", mask ,"\n")
+
+
+    # Element-wise multiplying the cosine_matrix with the mask, zeroing out diagonal
+    # Then sum all remaining values and divide by count of 1s in mask.
+    avg_cosine = (cosine_matrix * mask).sum()/mask.sum() # This measures how similar vectors are on average
+
+    print(f"Anisotropy: {avg_cosine:.3f} (0=isotropic, 1=anisotropic)")
+    return avg_cosine
+
+
+  def standardize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
+    """Standardize embeddings to reduce the anisotropy"""
+
+    # Compute mean and std across al embeddings
+    mu = embeddings.mean(axis = 0)  # [d_model]
+    sigma = embeddings.std(axis=0) # [d_model]
+
+    print(f"Mean norm: {np.linalg.norm(mu):.3f}")
+    print(f"Std range: [{sigma.min():.3f}, {sigma.max():.3f}]")
+
+    # Standardize: z = (x - mean) / std
+    standardized = (embeddings -mu) / (sigma + 1e-10)
+    print(f"After standardization: mean={standardized.mean():.3f}, std={standardized.std():.3f}")
+
+    return standardized
+
+"""### Test contextual embedding extraction"""
+
+extractor = ContextualEmbeddingExtractor(n_layers=12, d_model=256)
+
+# Simulate hidden states from 12 layers
+seq_len = 20
+hidden_states = [np.random.randn(seq_len, 256) for _ in range(12)]
+
+# Extract embeddings
+embeddings = extractor.extract_token_embeddings(hidden_states)
+
+# Check anisotropy
+anisotropy_before = extractor.compute_anisotropy(embeddings)
+
+# Standardize to reduce anisotropy
+standardized = extractor.standardize_embeddings(embeddings)
+
+
+anisotropy_after = extractor.compute_anisotropy(standardized)
+
+print(f"\nAnisotropy reduction: {anisotropy_before:.3f} -> {anisotropy_after:.3f}")
 
