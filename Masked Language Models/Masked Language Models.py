@@ -599,3 +599,192 @@ anisotropy_after = extractor.compute_anisotropy(standardized)
 
 print(f"\nAnisotropy reduction: {anisotropy_before:.3f} -> {anisotropy_after:.3f}")
 
+"""#  Word Sense Disambiguation with Contextual Embeddings"""
+
+class NearestNeighborWSD:
+  """Word sense disambiguation using contextual embeddigns"""
+
+  def __init__(self):
+    self.sense_embeddings = {} # sense_id -> embedding
+    self.sense_examples = {}   # sense_id -> example sentences
+
+  def create_sense_embeddings(self, labeled_examples: List[Tuple[str, str, np.ndarray]]):
+    """
+    Create sense embeddings from labeled examples
+    labeled_examples: List of (word, sense_id, context_embedding)
+    """
+
+    sense_vectors = {}
+
+    for word, sense_id, embedding in labeled_examples:
+      if sense_id not in sense_vectors:
+        sense_vectors[sense_id] = []
+        self.sense_examples[sense_id] = []
+
+      sense_vectors[sense_id].append(embedding)
+      self.sense_examples[sense_id].append(word)
+
+
+    # Average embedding per sense
+    for sense_id, vectors in sense_vectors.items():
+      self.sense_embeddings[sense_id] = np.mean(vectors, axis=0)
+      print(f"Sense '{sense_id}': {len(vectors)} examples, embedding shape {self.sense_embeddings[sense_id].shape}")
+
+
+  def disambiguate(self, target_embedding:np.ndarray, word:str) -> str:
+    """
+    Find nearest sense for the target word
+    """
+
+    best_sense = None
+    best_similarity = -1
+
+    # Compute cosine similarity with each sense
+    target_norm = target_embedding / (np.linalg.norm(target_embedding) + 1e-10) # Scaling dot product with the norms to avoid the effect of those too large values
+
+
+    for sense_id, sense_emb in self.sense_embeddings.items():
+      sense_norm = sense_emb / (np.linalg.norm(sense_emb) + 1e-10)
+      similarity = np.dot(target_norm, sense_norm)
+      print(f"Similarity to '{sense_id}': {similarity:.3f}")
+
+      if similarity > best_similarity:
+        best_similarity = similarity
+        best_sense = sense_id
+
+
+    print(f"\nPredicted sense: '{best_sense}' (similarity: {best_similarity:.3f})")
+    return best_sense
+
+"""# Test Nearest Neighbor Word Sense Disambiguation
+
+"""
+
+wsd = NearestNeighborWSD()
+
+# Create more diverse sense embeddings for 'bank' with 3 senses
+bank_examples = [
+    # Financial sense cluster (more examples for better centroid)
+    ("bank", "bank_financial", np.random.randn(256) * 0.3 + np.array([1.0, 0.5] + [0] * 254)),
+    ("bank", "bank_financial", np.random.randn(256) * 0.3 + np.array([1.2, 0.4] + [0] * 254)),
+    ("bank", "bank_financial", np.random.randn(256) * 0.3 + np.array([0.9, 0.6] + [0] * 254)),
+    ("bank", "bank_financial", np.random.randn(256) * 0.3 + np.array([1.1, 0.3] + [0] * 254)),
+
+    # River sense cluster
+    ("bank", "bank_river", np.random.randn(256) * 0.3 + np.array([-1.0, 0.8] + [0] * 254)),
+    ("bank", "bank_river", np.random.randn(256) * 0.3 + np.array([-0.9, 1.0] + [0] * 254)),
+    ("bank", "bank_river", np.random.randn(256) * 0.3 + np.array([-1.1, 0.7] + [0] * 254)),
+    ("bank", "bank_river", np.random.randn(256) * 0.3 + np.array([-0.8, 0.9] + [0] * 254)),
+
+    # Tilt/lean sense cluster (e.g., "bank the airplane")
+    ("bank", "bank_tilt", np.random.randn(256) * 0.3 + np.array([0.2, -1.2] + [0] * 254)),
+    ("bank", "bank_tilt", np.random.randn(256) * 0.3 + np.array([0.3, -1.0] + [0] * 254)),
+    ("bank", "bank_tilt", np.random.randn(256) * 0.3 + np.array([0.1, -1.1] + [0] * 254)),
+]
+
+wsd.create_sense_embeddings(bank_examples)
+
+# Test disambiguation with multiple targets
+print("\nTesting disambiguation:\n")
+
+test_targets = [
+    ("financial_context", np.random.randn(256) * 0.3 + np.array([1.0, 0.4] + [0] * 254)),
+    ("river_context", np.random.randn(256) * 0.3 + np.array([-1.0, 0.8] + [0] * 254)),
+    ("aviation_context", np.random.randn(256) * 0.3 + np.array([0.2, -1.0] + [0] * 254)),
+    ("ambiguous_context", np.random.randn(256) * 0.3 + np.array([0.0, 0.0] + [0] * 254)),
+]
+
+predictions = []
+for context_name, target_emb in test_targets:
+    print(f"\n{context_name}:")
+    predicted = wsd.disambiguate(target_emb, "bank")
+    predictions.append((context_name, predicted, target_emb))
+
+# Enhanced visualization with all test points
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=2)
+
+# Prepare all embeddings for PCA
+all_embeddings = []
+labels = []
+colors_list = []
+markers_list = []
+
+# Add sense centroids
+sense_colors = {'bank_financial': 'blue', 'bank_river': 'green', 'bank_tilt': 'orange'}
+for sense_id, emb in wsd.sense_embeddings.items():
+    all_embeddings.append(emb)
+    labels.append(f"{sense_id} (centroid)")
+    colors_list.append(sense_colors[sense_id])
+    markers_list.append('s')  # square for centroids
+
+# Add individual training examples
+for word, sense_id, emb in bank_examples:
+    all_embeddings.append(emb)
+    labels.append(None)  # Don't label individual points
+    colors_list.append(sense_colors[sense_id])
+    markers_list.append('o')  # circle for examples
+
+# Add test targets
+target_colors = {'financial_context': 'darkblue', 'river_context': 'darkgreen',
+                 'aviation_context': 'darkorange', 'ambiguous_context': 'red'}
+for context_name, predicted, emb in predictions:
+    all_embeddings.append(emb)
+    labels.append(f"{context_name}\n->{predicted.split('_')[1]}")
+    colors_list.append(target_colors[context_name])
+    markers_list.append('X')  # X for test points
+
+# Project to 2D
+projected = pca.fit_transform(all_embeddings)
+
+# Plot
+plt.figure(figsize=(12, 8))
+
+# Plot points
+for i, (x, y) in enumerate(projected):
+    if labels[i]:  # Only plot labeled points with labels
+        plt.scatter(x, y, c=colors_list[i], s=200 if markers_list[i] != 'o' else 50,
+                   marker=markers_list[i], edgecolors='black', linewidths=1.5)
+        if markers_list[i] != 'o':  # Add text labels for centroids and targets
+            plt.annotate(labels[i], (x, y), xytext=(5, 5), textcoords='offset points',
+                        fontsize=9, alpha=0.8)
+    else:  # Plot training examples without labels
+        plt.scatter(x, y, c=colors_list[i], s=30, marker=markers_list[i], alpha=0.5)
+
+plt.title('Word Sense Disambiguation: "bank" senses and test contexts', fontsize=14)
+plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
+plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+print("=== GRAPH ELEMENTS ===\n")
+
+print("1. SENSE CENTROIDS (large squares):")
+print("   - Blue square: 'bank_financial' centroid (average of 4 financial examples)")
+print("   - Green square: 'bank_river' centroid (average of 4 river examples)")
+print("   - Orange square: 'bank_tilt' centroid (average of 3 aviation examples)")
+
+print("\n2. TRAINING EXAMPLES (small circles, semi-transparent):")
+print("   - 4 light blue circles: individual financial bank examples")
+print("   - 4 light green circles: individual river bank examples")
+print("   - 3 light orange circles: individual tilt/aviation bank examples")
+
+print("\n3. TEST POINTS (large X markers with black edges):")
+print("   - Dark blue X: 'financial_context' - should classify as bank_financial")
+print("   - Dark green X: 'river_context' - should classify as bank_river")
+print("   - Dark orange X: 'aviation_context' - should classify as bank_tilt")
+print("   - Red X: 'ambiguous_context' - equidistant from all senses")
+
+print("\n4. VISUAL CLUSTERING:")
+print("   - PCA projects 256-dim vectors to 2D")
+print("   - Similar embeddings cluster together")
+print("   - Distance between points ≈ cosine similarity")
+print("   - Axes show % variance explained by each principal component")
+
+print("\n5. DISAMBIGUATION RESULTS:")
+print("   - Each test X should be closest to its matching color centroid")
+print("   - Ambiguous (red) X sits between clusters, picks nearest")
+
