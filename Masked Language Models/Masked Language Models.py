@@ -205,6 +205,9 @@ class BidirectionalAttention:
     Returns: sequence output [seq_len, d_model], attention [seq_len, seq_len]
     """
 
+
+    assert x.ndim == 2, f"Expected 2D input, got {x.ndim}D"  # Validate x shape
+
     seq_len = x.shape[0]
 
     # Compute Q, K, V
@@ -533,6 +536,10 @@ class ContextualEmbeddingExtractor:
     The solution is to standardize the embeddings: substract the mean and divide by the stdev
     """
 
+    if len(embeddings) < 2:
+        print("Need at least 2 embeddings to compute anisotropy")
+        return 0.0
+
     n_samples = min(100, len(embeddings))
     indices= np.random.choice(len(embeddings), n_samples, replace=False)
     sampled = embeddings[indices] # extracted the sampled embeddings
@@ -781,7 +788,7 @@ print("   - Red X: 'ambiguous_context' - equidistant from all senses")
 print("\n4. VISUAL CLUSTERING:")
 print("   - PCA projects 256-dim vectors to 2D")
 print("   - Similar embeddings cluster together")
-print("   - Distance between points ≈ cosine similarity")
+print("   - Distance between points ~ cosine similarity")
 print("   - Axes show % variance explained by each principal component")
 
 print("\n5. DISAMBIGUATION RESULTS:")
@@ -959,3 +966,158 @@ print(f"Optimizer: {training_args.optim}")
 # adamw_torch_fused: GPU-optimized optimizer used
 # Model specs: 2 layers, 2 attention heads, hidden_size=128
 
+"""# Name Entity Recognition (NER) with Transformers"""
+
+from transformers import(
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    pipeline
+)
+import torch
+
+class TransformerNER:
+  """
+  NER using pretrainged transformer models
+  Uses BIO Tagging: BERT model already fine-tuned for NER with BIO tags (B-PER, I-PER, B-ORG, I-ORG, B-LOC, I-LOC, O)
+  This model has MISC category: Besides standard PER/ORG/LOC, this model includes MISC (miscellaneous entities) for entities that don't fit other categories
+  """
+
+  def __init__(self, model_name: str="dslim/bert-base-NER"):
+    self.model = AutoModelForTokenClassification.from_pretrained(model_name) # Load pretrained NER model
+    self.tokenizer = AutoTokenizer.from_pretrained(model_name) # load the matching tokenizer
+
+    # Get label mappings
+    self.id2label = self.model.config.id2label # ID to label mapping from model config
+    self.label2id = self.model.config.label2id # Label to ID
+
+
+    print(f"\nNER Model: {model_name}\n")
+    print(f"\nLabels: {list(self.id2label.values())}\n")
+
+    # Move to GPU if available
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.model.to(self.device)
+
+  def align_tokens_to_words(self, tokens, labels, word_ids):
+    """
+    Align subword predictions back to words
+    The function takes the first subword's prediction as the word label
+    """
+
+    word_labels = []  # Store the label for each word (not subword)
+    previous_word_idx = None
+
+    for token, label, word_idx in zip(tokens, labels, word_ids):  # Iterate through tokens, their labels, and word mappings
+
+        if word_idx is None:  # Special tokens like [CLS], [SEP], [PAD]
+            continue  # Skip special tokens
+
+        elif word_idx != previous_word_idx:  # First subword of a new word
+            word_labels.append(label)  # Take the first subword's label as the word's label
+
+        # If word_idx == previous_word_idx, it's a continuation subword (like ##us in Linus)
+        # We skip it because we only take the first subword's prediction
+
+        previous_word_idx = word_idx
+
+    return word_labels  # Returns list of labels, one per original word
+
+
+  def predict(self, text: str):
+    """
+    Predict NER tags for text with BIO Tagging
+    Flow: text -> tokenize -> subwords -> model -> logits -> argmax -> BIO tags
+    """
+
+    # Tokenizer
+    inputs = self.tokenizer(
+        text,
+        return_tensors='pt',
+        truncation = True,  # if too long truncate
+        padding= True,      # if needed then pad
+    ).to(self.device)
+
+    # get word IDs for alignment
+    word_ids = inputs.word_ids(batch_index=0)  # Maps each subword to original word index. The 0 in nputs.word_ids(0) for batch dimension
+
+
+    # Forward pass
+    with torch.no_grad(): # disable grads computation for the inference
+      outputs = self.model(**inputs)
+      predictions = torch.argmax(outputs.logits, dim=-1) # get highest logit score for the prediction
+
+    # Map to Labels
+    tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0]) # Convert IDs back to subword tokens
+    print("\ntokens: ", tokens, "\n")
+
+    predicted_labels = [self.id2label[p.item()] for p in predictions[0]]  # Map predictions to label strings
+    print("predicted_labels: ", predicted_labels, "\n")
+
+    # Aggregate subword predictions to word level
+    word_labels = self.align_tokens_to_words(tokens, predicted_labels, word_ids)
+    print("word_labels: ", word_labels, "\n")
+
+    # Reconstruct words from tokens and word_ids
+    words = []
+    current_word_tokens = []
+    previous_word_idx = None
+
+    for token, word_idx in zip(tokens, word_ids):
+        if word_idx is None:  # Special tokens
+            continue
+        if word_idx != previous_word_idx and current_word_tokens:
+            # Join subwords and clean up ## prefixes
+            word = "".join(current_word_tokens).replace("##", "")
+            words.append(word)
+            current_word_tokens = []
+        if not token.startswith("##"):
+            current_word_tokens.append(token)
+        else:
+            current_word_tokens.append(token[2:])  # Remove ## prefix
+        previous_word_idx = word_idx
+
+    # Not forget the last word
+    if current_word_tokens:
+        word = "".join(current_word_tokens).replace("##", "")
+        words.append(word)
+
+    # Print word-level predictions
+    print(f"\nWord-level predictions:")
+    for word, label in zip(words, word_labels):
+        print(f"  {word} -> {label}")
+
+    print(f"\nSubword predictions:")
+    for token, label in list(zip(tokens, predicted_labels)):
+      # if token not in ['[CLS]', '[SEP]', '[PAD]']:  # Skip special tokens
+      print(f"  {token} -> {label}")
+
+    return tokens, predicted_labels, words, word_labels  # Return both subword and word level results
+
+"""### Test with pretrained NER model
+
+"""
+
+ner = TransformerNER()
+
+text = "Ariel Blitzer likes the Linux Open Source Organization, although Linus Torvalds likes Linux even more."
+print(f"\nInput text: {text}")
+
+tokens, labels, words, word_labels = ner.predict(text)
+
+# Use pipeline for cleaner output
+nlp = pipeline("ner", model=ner.model, tokenizer=ner.tokenizer, device=0 if torch.cuda.is_available() else -1)  # device=0 for GPU
+results = nlp(text)  # Pipeline handles tokenization, prediction, and aggregation
+
+print(f"\n\nExtracted entities:")
+for item in results:
+
+  print(f"\n  {item['word']} -> {item['entity']} (score: {item['score']:.3f})")  # Show entity with confidence score
+
+  if item['word'] == "##us":
+    print("\n      Error found with 2 consecutive 'B\'s in ##us -> B-PER'. There is only one Beginning of the unit of response.")
+
+
+# Compile model for faster inference
+if hasattr(torch, 'compile'):  # Check if PyTorch 2.0+ with compile support
+  ner.model = torch.compile(ner.model, mode='reduce-overhead')  # JIT compile for optimized inference
+  print("\nModel compiled with torch.compile for faster inference")
