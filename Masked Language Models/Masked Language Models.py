@@ -788,3 +788,174 @@ print("\n5. DISAMBIGUATION RESULTS:")
 print("   - Each test X should be closest to its matching color centroid")
 print("   - Ambiguous (red) X sits between clusters, picks nearest")
 
+"""# Fine-tuning for Classification with HF"""
+
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer
+)
+from datasets import Dataset
+import torch
+import torch.nn as nn
+
+class BERTFineTuner:
+  """Fine-tune BERT for sentence classification tasks"""
+
+  def __init__(self, model_name: str, num_labels:int):
+    self.model = AutoModelForSequenceClassification.from_pretrained(
+      model_name,
+      num_labels=num_labels, # output labels
+      ignore_mismatched_sizes=True # Allows changing the classifier head size
+    )
+
+    self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Freeze all but last 2 layers, standard for BERT fine-tuning
+    self.freeze_base_layers()
+
+    print(f"Model: {model_name}")
+    print(f"Trainable params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+    print(f"Frozen params: {sum(p.numel() for p in self.model.parameters() if not p.requires_grad):,}")
+
+
+  def freeze_base_layers(self):
+    """Freeze all but the last 2 encoder layers + the classifier head"""
+
+    # Chck which encoder model is
+    if hasattr(self.model, "bert"):
+      encoder = self.model.bert.encoder
+    elif hasattr(self.model, "roberta"):
+      encoder = self.model.roberta.encoder
+    else:
+      return # Unknown
+
+
+    for layer in encoder.layer[:-2]:     # Freeze all but the last 2 layers
+      for param in layer.parameters():
+        param.requires_grad = False # Not update during training
+
+  def prepare_dataset(self, texts: List[str], labels: List[int]):
+    """Tokenize and prepare dataset"""
+
+    encodings = self.tokenizer(
+        texts,
+        truncation = True, # Cut long sequences
+        padding=True, # Padding to same length with 0s
+        max_length = 128,
+        return_tensors='pt'
+    )
+
+    dataset = Dataset.from_dict({    # Mapping of strings to Arrays or Python lists.
+
+        'input_ids':      encodings['input_ids'], # Token ids
+        'attention_mask': encodings['attention_mask'], # 1 for real tokens and 0 for padding
+        'labels': torch.tensor(labels)
+    })
+
+
+    """
+    Special tokens breakdown:
+    101 = [CLS] token (start of sequence)
+    102 = [SEP] token (end of sequence)
+    0 = [PAD] token (padding to make all same length)
+
+
+    # encodings['input_ids'] would look like:
+    tensor([[  101,  2023,  3185,  2001,  7078,  10392,   999,   102,     0,     0],     # "This movie was absolutely fantastic!"
+            [  101,  6659,  3325,  1010,  2052,  2025, 16755,  1012,   102,     0],      # "Terrible experience, would not recommend."
+            [  101,  2009,  2001,  3100,  1010,  2498,  2569,  1012,   102,     0], ...  # "It was okay, nothing special."
+
+
+    # encodings['attention_mask'] would look like:
+    tensor([[1, 1, 1, 1, 1, 1, 1, 1, 0, 0],     # 1s for real tokens, 0s for padding
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 0],..
+
+
+    Example breakdown of first sentence:
+    "This movie was absolutely fantastic!"
+    [101,  2023,  3185,  2001,   7078,    10392,     999,   102]
+    [CLS]  This  movie  was   absolutely fantastic    !    [SEP]
+    """
+
+    return dataset
+
+"""## Simple test of fine-tuner"""
+
+# Initialize fine-tuner (using small model for demo)
+finetuner = BERTFineTuner('prajjwal1/bert-tiny', num_labels=3)  # Tiny BERT for quick demo
+
+# Sample data
+texts = [
+  "This movie was absolutely fantastic!",  # Positive sentiment
+  "Terrible experience, would not recommend.",  # Negative sentiment
+  "It was okay, nothing special.",  # Neutral sentiment
+  "Best product I've ever bought!",  # Positive
+  "Complete waste of money.",  # Negative
+  "Average quality, fair price."  # Neutral
+]
+
+#Steps per epoch = 6 samples / 2 batch_size = 3 steps -> will create folders checkpoint-3/ and checkpoint-6/
+
+
+labels = [0, 1, 2, 0, 1, 2]  # positive=0, negative=1, neutral=2
+
+dataset = finetuner.prepare_dataset(texts, labels)
+print(f"\nDataset size: {len(dataset)}")
+
+
+# Training arguments with mixed precision
+training_args = TrainingArguments(  #  configuration class from Hugging Face that controls all training hyperparameters
+  output_dir='./finetuned_model',   # Where to save model checkpoints
+  num_train_epochs=2,               # Number of training epochs
+  per_device_train_batch_size=2,    # Batch size per GPU
+  warmup_ratio=0.1,                 # 10% of steps for learning rate warmup
+  logging_steps=1,                  # Log every step
+  fp16=torch.cuda.is_available(),   # Mixed precision training if GPU available
+  gradient_checkpointing=True,      # Trade compute for memory - recompute activations during backprop
+  save_strategy='epoch',            # Automatically saves checkpoints every: 'epoch', 'steps', or 'no'
+  optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch"  # Fused optimizer for GPU efficiency
+)
+
+
+
+## To load the final checkpoint
+## model = AutoModelForSequenceClassification.from_pretrained('./finetuned_model/checkpoint-6')
+
+
+print("\nTraining configuration:")
+print(f"Mixed precision: {training_args.fp16}")
+print(f"Gradient checkpointing: {training_args.gradient_checkpointing}")
+print(f"Optimizer: {training_args.optim}")
+
+
+
+# Note: Actual training commented out for demo
+# trainer = Trainer(
+#   model=finetuner.model,
+#   args=training_args,
+#   train_dataset=dataset,
+# )
+# trainer.train()
+
+
+## Results using Weights and Biases
+# 2025-09-04 16:16:38,591 INFO    MainThread:871 [wandb_run.py:_config_callback():1380] config_cb None None {'return_dict': True, 'output_hidden_states': False, 'torchscript': False, 'torch_dtype': 'float32', 'pruned_heads': {}, 'tie_word_embeddings': True, 'chunk_size_feed_forward': 0, 'is_encoder_decoder': False, 'is_decoder': False, 'cross_attention_hidden_size': None, 'add_cross_attention': False, 'tie_encoder_decoder': False, 'architectures': None, 'finetuning_task': None, 'id2label': {0: 'LABEL_0', 1: 'LABEL_1', 2: 'LABEL_2'}, 'label2id': {'LABEL_0': 0, 'LABEL_1': 1, 'LABEL_2': 2}, 'task_specific_params': None, 'problem_type': None, 'tokenizer_class': None, 'prefix': None, 'bos_token_id': None, 'pad_token_id': 0, 'eos_token_id': None, 'sep_token_id': None, 'decoder_start_token_id': None, 'max_length': 20, 'min_length': 0, 'do_sample': False, 'early_stopping': False, 'num_beams': 1, 'num_beam_groups': 1, 'diversity_penalty': 0.0, 'temperature': 1.0, 'top_k': 50, 'top_p': 1.0, 'typical_p': 1.0, 'repetition_penalty': 1.0, 'length_penalty': 1.0, 'no_repeat_ngram_size': 0, 'encoder_no_repeat_ngram_size': 0, 'bad_words_ids': None, 'num_return_sequences': 1, 'output_scores': False, 'return_dict_in_generate': False, 'forced_bos_token_id': None, 'forced_eos_token_id': None, 'remove_invalid_values': False, 'exponential_decay_length_penalty': None, 'suppress_tokens': None, 'begin_suppress_tokens': None, '_name_or_path': 'prajjwal1/bert-tiny', 'transformers_version': '4.55.4', 'tf_legacy_loss': False, 'use_bfloat16': False, 'vocab_size': 30522, 'hidden_size': 128, 'num_hidden_layers': 2, 'num_attention_heads': 2, 'hidden_act': 'gelu', 'intermediate_size': 512, 'hidden_dropout_prob': 0.1, 'attention_probs_dropout_prob': 0.1, 'max_position_embeddings': 512, 'type_vocab_size': 2, 'initializer_range': 0.02, 'layer_norm_eps': 1e-12, 'position_embedding_type': 'absolute', 'use_cache': True, 'classifier_dropout': None, 'model_type': 'bert', 'output_attentions': False, 'output_dir': './finetuned_model', 'overwrite_output_dir': False, 'do_train': False, 'do_eval': False, 'do_predict': False, 'eval_strategy': 'no', 'prediction_loss_only': False, 'per_device_train_batch_size': 2, 'per_device_eval_batch_size': 8, 'per_gpu_train_batch_size': None, 'per_gpu_eval_batch_size': None, 'gradient_accumulation_steps': 1, 'eval_accumulation_steps': None, 'eval_delay': 0, 'torch_empty_cache_steps': None, 'learning_rate': 5e-05, 'weight_decay': 0.0, 'adam_beta1': 0.9, 'adam_beta2': 0.999, 'adam_epsilon': 1e-08, 'max_grad_norm': 1.0, 'num_train_epochs': 2, 'max_steps': -1, 'lr_scheduler_type': 'linear', 'lr_scheduler_kwargs': {}, 'warmup_ratio': 0.1, 'warmup_steps': 0, 'log_level': 'passive', 'log_level_replica': 'warning', 'log_on_each_node': True, 'logging_dir': './finetuned_model/runs/Sep04_16-16-18_b2695b79a6d0', 'logging_strategy': 'steps', 'logging_first_step': False, 'logging_steps': 1, 'logging_nan_inf_filter': True, 'save_strategy': 'epoch', 'save_steps': 500, 'save_total_limit': None, 'save_safetensors': True, 'save_on_each_node': False, 'save_only_model': False, 'restore_callback_states_from_checkpoint': False, 'no_cuda': False, 'use_cpu': False, 'use_mps_device': False, 'seed': 42, 'data_seed': None, 'jit_mode_eval': False, 'use_ipex': False, 'bf16': False, 'fp16': True, 'fp16_opt_level': 'O1', 'half_precision_backend': 'auto', 'bf16_full_eval': False, 'fp16_full_eval': False, 'tf32': None, 'local_rank': 0, 'ddp_backend': None, 'tpu_num_cores': None, 'tpu_metrics_debug': False, 'debug': [], 'dataloader_drop_last': False, 'eval_steps': None, 'dataloader_num_workers': 0, 'dataloader_prefetch_factor': None, 'past_index': -1, 'run_name': None, 'disable_tqdm': False, 'remove_unused_columns': True, 'label_names': None, 'load_best_model_at_end': False, 'metric_for_best_model': None, 'greater_is_better': None, 'ignore_data_skip': False, 'fsdp': [], 'fsdp_min_num_params': 0, 'fsdp_config': {'min_num_params': 0, 'xla': False, 'xla_fsdp_v2': False, 'xla_fsdp_grad_ckpt': False}, 'fsdp_transformer_layer_cls_to_wrap': None, 'accelerator_config': {'split_batches': False, 'dispatch_batches': None, 'even_batches': True, 'use_seedable_sampler': True, 'non_blocking': False, 'gradient_accumulation_kwargs': None}, 'deepspeed': None, 'label_smoothing_factor': 0.0, 'optim': 'adamw_torch_fused', 'optim_args': None, 'adafactor': False, 'group_by_length': False, 'length_column_name': 'length', 'report_to': ['tensorboard', 'wandb'], 'ddp_find_unused_parameters': None, 'ddp_bucket_cap_mb': None, 'ddp_broadcast_buffers': None, 'dataloader_pin_memory': True, 'dataloader_persistent_workers': False, 'skip_memory_metrics': True, 'use_legacy_prediction_loop': False, 'push_to_hub': False, 'resume_from_checkpoint': None, 'hub_model_id': None, 'hub_strategy': 'every_save', 'hub_token': '<HUB_TOKEN>', 'hub_private_repo': None, 'hub_always_push': False, 'hub_revision': None, 'gradient_checkpointing': True, 'gradient_checkpointing_kwargs': None, 'include_inputs_for_metrics': False, 'include_for_metrics': [], 'eval_do_concat_batches': True, 'fp16_backend': 'auto', 'push_to_hub_model_id': None, 'push_to_hub_organization': None, 'push_to_hub_token': '<PUSH_TO_HUB_TOKEN>', 'mp_parameters': '', 'auto_find_batch_size': False, 'full_determinism': False, 'torchdynamo': None, 'ray_scope': 'last', 'ddp_timeout': 1800, 'torch_compile': False, 'torch_compile_backend': None, 'torch_compile_mode': None, 'include_tokens_per_second': False, 'include_num_input_tokens_seen': False, 'neftune_noise_alpha': None, 'optim_target_modules': None, 'batch_eval_metrics': False, 'eval_on_start': False, 'use_liger_kernel': False, 'liger_kernel_config': None, 'eval_use_gather_object': False, 'average_tokens_across_devices': False}
+# Step	Training Loss
+# 1	1.077100
+# 2	1.040500
+# 3	1.140600
+# 4	1.043000
+# 5	1.131300
+# 6	1.063000
+
+# From W&Bs logs:
+# TrainOutput(global_step=6, training_loss=1.0826009114583333, metrics={'train_runtime': 20.0302, 'train_samples_per_second': 0.599, 'train_steps_per_second': 0.3, 'total_flos': 297863280.0, 'train_loss': 1.0826009114583333, 'epoch': 2.0})
+# save_safetensors: True (using safer format than .bin)
+# fp16: Enabled (mixed precision working)
+# gradient_checkpointing: True (memory optimization active)
+# adamw_torch_fused: GPU-optimized optimizer used
+# Model specs: 2 layers, 2 attention heads, hidden_size=128
+
