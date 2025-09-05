@@ -12,12 +12,18 @@ Original file is located at
 !pip install evaluate # HF evaluate lib for metrics
 !pip install bitsandbytes # 8 bit Adam optimizer
 !pip install trl # Transformer Reinforcement Learning
+!pip install sacrebleu  # BLEU (Bilingual Evaluation Understudy)  metric dependency
+!pip install rouge_score  # BLEU (Bilingual Evaluation Understudy)  metric dependency
+# BLEU (Bilingual Evaluation Understudy) is a metric for evaluating machine-generated text quality, especially in translation and text generation tasks
+# BLEU evaluates text generation quality by counting matching n-grams (1-4 word sequences) between generated and reference text, applying a brevity penalty, and scoring 0-1 where 0.6+ is excellent, 0.4-0.6 is good, 0.2-0.4 is fair, and below 0.2 is poor. For example, comparing "The cat sits on the mat" to reference "The cat is on the mat" yields ~0.7 (good) based on overlapping words and phrases. It's widely used for machine translation, summarization, and instruction tuning evaluation, but has limitations since it favors literal matches over semantic meaning and can miss quality paraphrases that use different vocabulary.
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, List, Tuple, Optional, Any, Union
@@ -55,7 +61,7 @@ try:
 
   from accelerate import Accelerator # Distributed training support
   from accelerate.utils import set_seed # seed setting for accelerate
-  import bitsandbytes as nbn # 8bit adam optimizer
+  import bitsandbytes as bnb # 8bit adam optimizer
 
   HF_AVAILABLE = True
   print("HuggingFace libraries available with enhancements")
@@ -321,3 +327,371 @@ print(f"Rejected: {pref.rejected[:50]}...")
 # Show Pydantic v2 JSON serialization
 print("\nPydantic v2 JSON Schema:")
 print(PreferencePair.model_json_schema())  # v2 method for getting JSON schema
+
+"""# Vanilla Instruction Tuning Implementation"""
+
+class VanillaInstructionTuning:
+  """Simple instruction tuning using standard language modeling loss"""
+
+  def __init__(self, vocab_size: int, hidden_size: int, learning_rate: float=1e-3):
+    self.vocab_size = vocab_size
+    self.hidden_size = hidden_size
+    self.learning_rate = learning_rate
+
+    # simple embedding and output layers
+    self.embedding = np.random.randn(vocab_size,hidden_size) *0.01
+    self.output_layer = np.random.randn(hidden_size, vocab_size )* 0.01
+
+    print(f"Initialized instruction tuning model:")
+    print(f"  Embedding matrix: {self.embedding.shape} = [{vocab_size}, {hidden_size}]")
+    print(f"  Output layer: {self.output_layer.shape} = [{hidden_size}, {vocab_size}]")
+
+  def forward(self, input_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Forward pass
+    input_ids: [batch_size, seq_len] token indices
+    Returns: logits [batch_size, seq_len, vocab_size], hidden_states [batch_size, seq_len, hidden_size ]
+    """
+
+    batch_size, seq_len = input_ids.shape
+
+    # Embedding lookup [B,L] -> [B, L, H]
+    hidden_states = self.embedding[input_ids] # index to embedding mtrix
+    print(f"\nEmbedding lookup: {input_ids.shape} -> {hidden_states.shape}")
+    print(f"  Sample embeddings: {hidden_states[0, 0, :5]}...")  # First 5 dims of first token
+
+    # output projection [B, L, H] @ [H, V] = [B, L , V]
+    hidden_flat = hidden_states.reshape(-1, self.hidden_size) # reshape for matmul [B*L, H]
+    logits_flat = hidden_flat @ self.output_layer # [B*L, V] matmul
+    logits = logits_flat.reshape(batch_size, seq_len, self.vocab_size) #[B, L, V]
+
+    print(f"Output projection: {hidden_states.shape} @ {self.output_layer.shape} = {logits.shape}")
+    print(f"  Logits range: [{logits.min():.3f}, {logits.max():.3f}]")
+
+    return logits, hidden_states
+
+
+  def compute_loss(self, logits: np.ndarray, targets:np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    """
+    Compute cross-entropy loss
+    logits: [batch_size, seq_len, vocab_size] predicted scores
+    targets: [batch_size, seq_len] true token indices
+    mask: [batch_size, seq_len] binary mask for valid positions
+    """
+    batch_size, seq_len, vocab_size = logits.shape
+
+    # softmax: exp(x) / sum(exp(x))
+    logits_max = np.max(logits, axis=-1, keepdims=True )  # [B, L, 1] for numerical stability
+    exp_logits = np.exp(logits - logits_max) # remove max over all to avoid overflow
+    probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)  # [B, L, V] normalized probs
+
+    # Extract probabilities of true tokens
+    batch_indices = np.arange(batch_size)[:, None] # [B, 1] for indexing. The None here is NumPy’s way of adding a new axis (same as np.newaxis). Takes shape (B,) and reshapes into (B, 1).
+    seq_indices = np.arange(seq_len)[None, :] # The None here is NumPy’s way of adding a new axis (same as np.newaxis). Takes shape (B,) and reshapes into (B, 1)
+    target_probs = probs[batch_indices, seq_indices, targets] # [B, L] real probs
+
+    # Neg Log likelihood: -log(P(correct_token))
+    loss_matrix = -np.log(target_probs + 1e-10) # add small value to avoid log(0)
+
+    if mask is not None:
+      loss_matrix = loss_matrix * mask # zero out padded positions
+      total_loss = np.sum(loss_matrix) / np.sum(mask) # avg over only valid tokens
+    else:
+      total_loss = np.mean(loss_matrix) # avg over all the tokens
+
+
+    print(f"\nLoss computation:")
+    print(f"  Target probs shape: {target_probs.shape}")
+    print(f"  Sample target probs: {target_probs[0, :5]}")  # First 5 positions
+    print(f"  Loss: {total_loss:.4f}")
+
+    return total_loss
+
+
+  def train_step(self, input_ids: np.ndarray, targets:np.ndarray) -> float:
+    """Single training step with gradietn descent"""
+    # Forward pass
+    logits, hidden_states = self.forward(input_ids)
+    loss = self.compute_loss(logits, targets)
+
+    # simpified gradient update
+    self.embedding    *= (1 - self.learning_rate * 0.01) # simple weight decay
+    self.output_layer *= (1 - self.learning_rate * 0.01) # simple weight decay
+
+    return loss
+
+"""### Test vanilla instruction tuning"""
+
+model = VanillaInstructionTuning(vocab_size=1000, hidden_size=64)
+
+# Create dummy data
+batch_size, seq_len = 2, 10
+input_ids = np.random.randint(0, 1000, (batch_size, seq_len))  # Random token indices
+targets = np.random.randint(0, 1000, (batch_size, seq_len))  # Target tokens (shifted in practice)
+
+print(f"Input shape: {input_ids.shape}")
+print(f"Target shape: {targets.shape}")
+
+# Forward pass
+logits, hidden = model.forward(input_ids)
+
+# Compute loss
+loss = model.compute_loss(logits, targets)
+
+# Training step
+print("\n" + "-"*30 + "\n")
+print("Training step:")
+train_loss = model.train_step(input_ids, targets)
+print(f"Training loss: {train_loss:.4f}")
+
+"""# PyTorch Instruction Tuning with HF"""
+
+class InstructionTuningDataset(Dataset):
+ """PyTorch dataset for instruction tuning with validation"""
+
+ def __init__(self, examples:List[InstructionExample], tokenizer, max_length: int = 512 ):
+   self.examples = examples
+   self.tokenizer = tokenizer
+   self.max_length = max_length
+
+ def __len__(self):
+   return len(self.examples )
+
+ def __getitem__(self, idx):
+   example = self.examples[idx]
+
+   # Format as full text (instruction + response)
+   text = example.format_full() # pydantic models method
+
+   # tokenize with attn mask
+   encoding = self.tokenizer(
+       text,
+       truncation=True, # trunc to max_length
+       padding='max_length', # pad to max length
+       max_length=self.max_length,
+       return_tensors='pt'
+
+   )
+
+   encoding['labels'] = encoding['input_ids'].clone() # copy input_ids as labels
+
+   # Mask padding tokens (100 is ignore index in Cross Entropy Loss)
+   encoding['labels'][encoding['attention_mask'] == 0] = -100 # ignore padding in loss
+
+   return {k:v.squeeze(0) for k,v in encoding.items()}
+
+def setup_instruction_tuning_pytorch_enhanced():
+ """Setup instruction tuning with PyTorch, HuggingFace, and PEFT for efficiency"""
+
+ # inicialtize accelerator
+ accelerator = Accelerator(
+     mixed_precision = 'fp16' if torch.cuda.is_available() else None,
+     gradient_accumulation_steps=4 # accum gradients for larger effective batch size
+ )
+
+ # load model with opt 8-bit quant
+ model_name = 'gpt2'
+ print(f"Loading model: {model_name}")
+
+ # 8-bit quantization if gpu
+ quantization_config = None
+ if torch.cuda.is_available() and 'bitsandbytes' in sys.modules:
+   quantization_config = BitsAndBytesConfig(
+       load_in_8bit = True,  # load in 8bit
+       bnb_8bit_compute_dtype=torch.float16, # compute in fp16
+       bnb_8bit_quant_type="nf8", # quantization type
+       bnb_8bit_use_double_quant=True, # double quantization for more saved mem. Quantizes also the Quantization Metadata:the scaling factors (and sometimes offsets/zero-points) that tell you how to map the stored int8 values back to approximate floating-point weights.
+   )
+   print("Using 8-bit quantization for memory efficiency")
+
+ # load tokenizer
+ tokenizer = AutoTokenizer.from_pretrained(model_name)
+ tokenizer.pad_token = tokenizer.eos_token # set padding tkn
+ tokenizer.padding_side = 'right' # pad on the right for Causal LM
+
+ # load model with opt quantization
+ if quantization_config:
+   model = AutoModelForCausalLM.from_pretrained(
+       model_name,
+       quantization_config=quantization_config,
+       device_map="Auto"
+   )
+
+   # prepare model for k-bit training
+   model = prepare_model_for_kbit_training(model) # `prepare_model_for_kbit_training` modifies a model's weights and layers to be compatible with low-bit (8-bit or 4-bit) training, enabling memory-efficient fine-tuning.
+
+ else:
+   model = AutoModelForCausalLM.from_pretrained(model_name)
+
+ print(f"Model loaded: {model.config.n_layer} layers, {model.config.n_head} heads")
+ print(f"Vocab size: {model.config.vocab_size}")
+ print(f"Hidden size: {model.config.n_embd}")
+
+
+ # Configure PEFT (LoRA) for parameter-efficient fine-tuning
+ peft_config = LoraConfig(
+     task_type=TaskType.CAUSAL_LM,
+     r=16, # lora rank -lower
+     lora_alpha = 32, # scaling param
+     lora_dropout=0.1,
+     bias='none', # not adapt biases
+     target_modules=["c_attn", "c_proj"] # gpt2 attn layers to adapt
+ )
+
+
+ # Convert to PEFT model
+ model = get_peft_model(model, peft_config) # wrap model with LoRA adapters
+ model.print_trainable_parameters() # shows param efficiency gain
+
+ # prepare dataset
+ instruction_examples = create_instruction_dataset() # pydantic validation
+ dataset = InstructionTuningDataset(instruction_examples, tokenizer, max_length=128)
+
+ # create dataloader
+ dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+ # seutp optimizer with 8bit adam if available
+ if torch.cuda.is_available() and 'bitsandbytes' in sys.modules:
+   optimizer = bnb.optim.AdamW8bit(
+       model.parameters(),
+       lr=5e-5,
+       betas=(0.9, 0.999), # adam betas variables
+       weight_decay=0.01, # weight decay for regularization
+   )
+   print("Using 8-bit AdamW optimizer")
+
+ else:
+   optimizer = torch.optim.AdamW(
+       model.parameters(),
+       lr=5e-5,
+       weight_decay=0.01  # weight decay for regularization
+   )
+
+ # setup lr scheduler
+ # The scheduler will cyclically vary the learning rate with cosine decay, restarting every T_i iterations while gradually increasing the period and never letting the LR drop below eta_min
+ # The learning rate will follow a cosine decay for 10 iterations, then restart for 20 iterations, then 40, doubling each cycle, while never dropping below 1e-6.
+ scheduler = CosineAnnealingWarmRestarts(
+     optimizer,
+     T_0=10,  # Number of iterations for the first restart
+     T_mult=2,  # Factor to increase T_i after a restart
+     eta_min=1e-6,  # Minimum learning rate, never below it
+ )
+
+
+ # Prepare everything with accelerator
+ model, optimizer, dataloader, scheduler = accelerator.prepare(
+     model, optimizer, dataloader, scheduler
+ )
+
+ # Initialize evaluation metrics
+ bleu_metric = evaluate.load("bleu")  # BLEU score for generation quality
+ rouge_metric = evaluate.load("rouge")  # ROUGE score for summarization
+
+ return model, tokenizer, dataloader, optimizer, scheduler, accelerator, bleu_metric, rouge_metric
+
+# Setup and test enhanced training
+model, tokenizer, dataloader, optimizer, scheduler, accelerator, bleu_metric, rouge_metric = setup_instruction_tuning_pytorch_enhanced()
+
+# Test one training step with metrics
+print("\n" + "-"*50)
+print("Testing enhanced training step with metrics:")
+
+model.train()  # Set to training mode
+
+for batch_idx, batch in enumerate(dataloader):
+ if batch_idx > 0:  # Just test one batch
+   break
+
+ # Move batch to accelerator device (handles multi-GPU automatically)
+ # Note: accelerator.prepare already handles device placement
+
+ print(f"Batch shapes:")
+ print(f"  input_ids: {batch['input_ids'].shape}")
+ print(f"  attention_mask: {batch['attention_mask'].shape}")
+ print(f"  labels: {batch['labels'].shape}")
+
+ # Forward pass with accelerator's context
+ with accelerator.accumulate(model):  # Handle gradient accumulation
+   outputs = model(**batch)  # Pass entire batch to model
+   loss = outputs.loss  # Extract loss
+   logits = outputs.logits  # Extract logits
+
+   print(f"\nForward pass:")
+   print(f"  Loss: {loss.item():.4f}")
+   print(f"  Logits shape: {logits.shape}")
+   print(f"  Perplexity: {torch.exp(loss).item():.2f}")
+
+   # Backward pass with accelerator (handles mixed precision)
+   accelerator.backward(loss)  # Compute gradients with automatic mixed precision
+
+   # Gradient clipping for stability
+   accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients to prevent explosion
+
+   # Gradient norm for monitoring
+   total_norm = 0
+   for p in model.parameters():
+     if p.grad is not None:
+       total_norm += p.grad.data.norm(2).item() ** 2  # L2 norm squared
+   total_norm = total_norm ** 0.5  # Square root for final norm
+   print(f"  Gradient norm: {total_norm:.4f}")
+
+   # Update weights
+   optimizer.step()  # Apply gradients
+   scheduler.step()  # Update learning rate
+   optimizer.zero_grad()  # Reset gradients
+
+   # Log to wandb if enabled
+   if USE_WANDB:
+     wandb.log({
+       "train/loss": loss.item(),
+       "train/perplexity": torch.exp(loss).item(),
+       "train/grad_norm": total_norm,
+       "train/learning_rate": scheduler.get_last_lr()[0],
+     })
+
+# Generate sample output with beam search
+print("\n" + "-"*50)
+print("Testing generation with enhanced decoding:")
+
+model.eval()  # Set to evaluation mode
+
+test_instruction = "Translate to French: Hello world"
+prompt = f"### Instruction:\n{test_instruction}\n\n### Response:\n"
+
+# Tokenize prompt
+inputs = tokenizer(prompt, return_tensors='pt')
+# Move to accelerator device
+inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+
+# Generate with enhanced parameters
+with torch.no_grad():
+ outputs = model.generate(
+   **inputs,
+   max_new_tokens=20,  # Generate up to 20 new tokens
+   temperature=0.8,  # Sampling temperature
+   do_sample=True,  # Use sampling instead of greedy
+   top_p=0.9,  # Nucleus sampling threshold
+   top_k=50,  # Top-k sampling
+   repetition_penalty=1.2,  # Penalize repetition
+   pad_token_id=tokenizer.eos_token_id,
+   num_beams=4,  # Beam search for better quality
+   early_stopping=True,  # Stop when all beams reach EOS
+ )
+
+# Decode and evaluate
+generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"Input: {prompt}")
+print(f"Generated: {generated_text}")
+
+# Compute BLEU score (example - normally done on validation set)
+reference = ["Bonjour le monde"]  # Expected translation
+prediction = generated_text.split("### Response:\n")[-1].strip()
+
+bleu_score = bleu_metric.compute(predictions=[prediction], references=[[ref] for ref in reference])
+print(f"\nGeneration metrics:")
+print(f"  BLEU score: {bleu_score['bleu']:.4f}\n")
+
+print("\nInsufficient Training: Your model saw only 5 examples for 1 step. Language models need thousands of examples and many epochs to learn new tasks.")
+print("\nData Mismatch: The model hasn't learned the instruction format properly. GPT-2 wasn't trained on instruction-following data.")
+print("\nRepetition Issue: The model is stuck in a loop due to poor conditioning on the prompt format.")
+
