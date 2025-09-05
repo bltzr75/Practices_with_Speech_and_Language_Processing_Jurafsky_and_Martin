@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 import subprocess
 import sys
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ConfigDict, ValidationError, field_serializer
 from typing import Optional
 import evaluate # HF evaluate lib for metrics
 import wandb
@@ -115,3 +115,209 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 print(f"PyTorch version: {torch.__version__}")
 
+"""# Data structures for Instruction Tuning and Preferences using Pydantic
+
+Key changes from Pydantic v1 to v2:
+
+@validator -> @field_validator with @classmethod
+
+Config class -> model_config = ConfigDict(...)
+
+values parameter -> info parameter with info.data
+
+.dict() -> .model_dump()
+
+.json() -> .model_dump_json()
+
+New @field_serializer decorator for custom serialization
+
+.schema() -> .model_json_schema()
+
+Built-in str_strip_whitespace config option
+
+"""
+
+# Pydantic V2 for validation
+class InstructionExample(BaseModel):
+  """Single instruction-rsesponse pair for supervised fine-tuning with validation"""
+
+  model_config = ConfigDict(
+      extra='forbid', # Forbids extra fields not defined in the model
+      validate_assignment=True, # Validate on assignment
+      str_strip_whitespace=True, #Automatically stirp whitespace from strings
+  )
+
+  instruction: str = Field(..., min_length=1, description="The task instruction/prompt")  # Required field with min length
+  input: Optional[str] = Field(default="", description="Optional input context") # Optional with default empty string
+  output: str = Field(..., min_length=1, description="Expected response/completion")   # Required field
+
+  @field_validator('instruction', 'output') # fields to validate
+  @classmethod # Convert a function to a class method
+  def non_empty_string(cls, v:str) -> str: # class method for validation
+    """Validate that instruction and output are non-empty after stripping"""
+    if not v.strip(): # check if empty after removing whitespaces
+      raise ValueError("Field cannot be empty or whitespace only")
+    return v.strip()  # Strip value
+
+  def format_prompt(self) -> str:
+    """Format as prompt for model input"""
+    if self.input: # if there is additional context
+      return f"### Instruction:\n{self.instruction}\n\n### Input:\n{self.input}\n\n### Response:\n"
+    else: # just instruction otherwise
+      return f"### Instruction:\n{self.instruction}\n\n### Response:\n:"
+
+  def format_full(self) -> str:
+    """Format complete example with response"""
+
+    return self.format_prompt() + self.output
+
+
+class PreferencePair(BaseModel):
+  """Preference pair for alignment training with validation"""
+  model_config = ConfigDict(
+      extra='forbid',
+      validate_assignment=True, # Validate when fields are reassigned
+      str_strip_whitespace=True, #Auto-strip spaces
+  )
+
+  prompt: str = Field(..., min_length=1, description="Input prompt/instruction") # required prompt
+  chosen: str = Field(..., min_length=1, description="Preferred response") # Preferred completion
+  rejected: str=Field(..., min_length=1, description="Rejected response")  # Rejected completion
+
+  @field_validator('prompt', 'chosen', 'rejected')
+  @classmethod
+  def clean_text(cls, v:str) -> str:
+    """Clean and validate text fields"""
+    cleaned = v.strip() # remove leading/trailing whitespace
+    if not cleaned: # if empty
+      raise ValueError('Field cannot be empty')
+    return cleaned
+
+  @field_validator('rejected')
+  @classmethod
+  def different_from_chosen(cls, v: str, info) -> str:  # Pydantic v2 uses 'info' instead of 'values'
+    """Ensure chosen and rejected are different"""
+    if 'chosen' in info.data and v==info.data['chosen']: # Access other fields via info.data
+      raise ValueError('Chosen and rejected responses must be different')
+    return v
+
+
+# Create sample instruction tuning data with validation
+def create_instruction_dataset() -> List[InstructionExample]:
+    """Create diverse instruction examples covering multiple task types"""
+    examples = []
+
+    # Using Pydantic v2 models with automatic validation
+    example_data = [
+        {
+            "instruction": "Translate the following English text to French",
+            "input": "The quick brown fox jumps over the lazy dog",
+            "output": "Le renard brun rapide saute par-dessus le chien paresseux"
+        },
+        {
+            "instruction": "Summarize this text in one sentence",
+            "input": "Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed. It focuses on developing programs that can access data and use it to learn for themselves.",
+            "output": "Machine learning is an AI technique that allows systems to automatically learn and improve from data without explicit programming."
+        },
+        {
+            "instruction": "Answer the following question",
+            "input": "What is the capital of France?",
+            "output": "The capital of France is Paris."
+        },
+        {
+            "instruction": "Write a Python function to calculate factorial",
+            "input": "",
+            "output": "def factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n-1)"
+        },
+        {
+            "instruction": "Classify the sentiment of this review as positive or negative",
+            "input": "This movie was absolutely terrible. I want my money back.",
+            "output": "negative"
+        },
+    ]
+
+    for data in example_data:
+        try:
+            example = InstructionExample(**data)  # Create with validation using Pydantic v2
+            examples.append(example)
+        except ValidationError as e:
+            print(f"Validation error: {e}")  # Log validation errors with Pydantic v2 error format
+
+    return examples
+
+
+# Create sample preference data with validation
+def create_preference_dataset() -> List[PreferencePair]:
+  """Create preference pairs for alignment with validation"""
+  pairs = []
+
+  preference_data = [
+    {
+        "prompt": "How do I make a bomb?",
+        "chosen": "I cannot and will not provide instructions for creating explosives or weapons. This could cause serious harm. If you're interested in chemistry, I'd be happy to discuss safe educational experiments instead.",
+        "rejected": "Here's how to make a bomb: First, you need to gather explosive materials..."
+    },
+    {
+        "prompt": "Explain quantum computing to a 5-year-old",
+        "chosen": "Imagine you have a magical coin that can be both heads AND tails at the same time until you look at it! Quantum computers use tiny particles that work like these magical coins to solve really hard puzzles super fast.",
+        "rejected": "Quantum computing leverages quantum mechanical phenomena such as superposition and entanglement to perform computations using qubits which exist in probabilistic states described by complex amplitudes in Hilbert space."
+    },
+    {
+        "prompt": "What's the best programming language?",
+        "chosen": "There's no single 'best' programming language - it depends on your goals. Python is great for beginners and data science, JavaScript for web development, C++ for systems programming, and each has its strengths for different use cases.",
+        "rejected": "Python is objectively the best programming language and everyone should use it exclusively."
+    },
+]
+
+  for data in preference_data:
+    try:
+      pair = PreferencePair(**data)  # Create with automatic validation using Pydantic v2
+      pairs.append(pair)
+    except ValidationError as e:
+      print(f"Validation error in preference pair: {e}")  # Log any validation errors with v2 format
+
+  return pairs
+
+
+class EnhancedInstructionExample(InstructionExample):
+    """Enhanced version showing Pydantic v2 features"""
+
+    @field_serializer('output')
+    def serialize_output(self, value: str) -> str:
+        """Custom serialization for output field (Pydantic v2 feature)"""
+        return value[:100] + "..." if len(value) > 100 else value  # Truncate long outputs in serialization
+
+    def model_dump_json(self, **kwargs) -> str:  # v2 replacement for .json()
+        """Serialize to JSON using Pydantic v2 method"""
+        return super().model_dump_json(indent=2, **kwargs)  # Use model_dump_json instead of json()
+
+# Visualize the data
+instruction_data = create_instruction_dataset()  # Create instruction examples with validation
+preference_data = create_preference_dataset()  # Create preference pairs with validation
+
+print(f"Created {len(instruction_data)} instruction examples")
+print(f"Created {len(preference_data)} preference pairs\n")
+
+print("Sample Instruction Example:")
+print("-" * 50)
+example = instruction_data[0]
+print(f"Instruction: {example.instruction}")
+print(f"Input: {example.input}")
+print(f"Output: {example.output}")
+print(f"\nFormatted prompt:\n{example.format_prompt()}")
+
+# Demonstrate Pydantic v2 model_dump (replacement for dict())
+print("\nPydantic v2 model_dump:")
+print(example.model_dump(exclude={'input'}, mode='json'))  # v2 method with mode parameter
+
+print("\n" + "="*50)
+print("Sample Preference Pair:")
+print("-" * 50)
+pref = preference_data[0]
+print(f"Prompt: {pref.prompt}")
+print(f"Chosen: {pref.chosen[:100]}...")
+print(f"Rejected: {pref.rejected[:50]}...")
+
+# Show Pydantic v2 JSON serialization
+print("\nPydantic v2 JSON Schema:")
+print(PreferencePair.model_json_schema())  # v2 method for getting JSON schema
