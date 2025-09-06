@@ -35,8 +35,18 @@ import subprocess
 import sys
 from pydantic import BaseModel, Field, field_validator, ConfigDict, ValidationError, field_serializer
 from typing import Optional
+
 import evaluate # HF evaluate lib for metrics
+
+
+from google.colab import userdata
+
+from huggingface_hub import login as hf_login
+hf_login(token=userdata.get('test_hf_1'))
+
 import wandb
+wandb.login(key=userdata.get('WANDB_API_KEY'))
+
 
 try:
 
@@ -92,7 +102,7 @@ except ImportError:
 
 
 # Init wandb for experiment tracking
-USE_WANDB = False
+USE_WANDB = True #False  ## Change if prefering otherwise
 
 if USE_WANDB:
   wandb.init(
@@ -102,7 +112,7 @@ if USE_WANDB:
                'dataset':"custom-instructions",
                'learning_rate':5e-5,
       },
-      model='online' # offline for local logging instead
+      # model='online' # offline for local logging instead  # returned error, to check
   )
 
 
@@ -694,4 +704,224 @@ print(f"  BLEU score: {bleu_score['bleu']:.4f}\n")
 print("\nInsufficient Training: Your model saw only 5 examples for 1 step. Language models need thousands of examples and many epochs to learn new tasks.")
 print("\nData Mismatch: The model hasn't learned the instruction format properly. GPT-2 wasn't trained on instruction-following data.")
 print("\nRepetition Issue: The model is stuck in a loop due to poor conditioning on the prompt format.")
+
+"""# Bradley-Terry Preference Model
+
+1. HUMAN LABELS: (A > B), (C > D), (E > F)... [preference dataset]
+
+                        ↓
+
+2. INITIALIZE: Reward model r_θ with random weights θ₀
+                        ↓
+
+3. FORWARD PASS: r_θ(prompt, A) → score_A, r_θ(prompt, B) → score_B
+
+                        ↓
+
+4. COMPUTE PROBABILITY: P(A > B) = σ(score_A - score_B)
+
+                        ↓
+
+5. MEASURE ERROR: Loss = -log P(human_choice)
+
+                        ↓
+                      
+6. BACKPROP: ∇Loss flows through network to compute ∇θ
+
+                        ↓
+
+7. UPDATE: θ_new = θ_old - learning_rate × ∇θ
+
+                        ↓
+
+8. REPEAT: Go to step 3 with next batch until convergence
+
+                        ↓
+
+9. RESULT: Trained r_θ that assigns higher scores to human-preferred outputs
+"""
+
+class BradleyTerryModel:
+  """
+  Bradley-Terry model for preference probabilities
+  P(o_i > o_j | x) = σ(z_i - zz_j) where z_i, z_j are scores
+  """
+
+  def __init__(self):
+    print("Bradley-Terry Preference Model")
+    print("Mathematical formulation: P(o_i ≻ o_j|x) = 1 / (1 + exp(-(z_i - z_j)))")
+    print("Where z_i, z_j are scalar rewards/scores for outputs o_i, o_j\n")
+
+  def compute_preference_prob(self, score_i: float, score_j: float) -> float:
+    """
+    Compute probability that option i is preferred over option j
+    Uses sigmoid function on the difference of both scores
+    Useful for data pair-decomposed like in preference optimization alignment
+    """
+
+    score_diff = score_i-score_j
+    print(f"Score difference: z_i - z_j = {score_i:.3f} - {score_j:.3f} = {score_diff:.3f}")
+
+
+    # logistic sigmoid σ(x) = 1/(1+exp(-z))
+    prob = 1.0 / (1.0 + np.exp(-score_diff))
+    print(f"P(o_i ≻ o_j) = σ({score_diff:.3f}) = {prob:.4f}")
+
+
+    # interpretation
+    if prob > 0.5:
+      print(f"Option i is preferred (p={prob:.2%})")
+
+    elif prob < 0.5:
+      print(f"Option j is preferred (p={(1-prob):.2%})")
+
+    else:
+      print("No preference (p=50%)")
+
+    return prob
+
+  def compute_log_likelihood(self, scores_chosen:np.ndarray, scores_rejected:np.ndarray):
+    """
+    Compute log likelihood of preference
+    scores_chosen: [n_samples] scores for chosen responses
+    scores_rejected: [n_samples] scores for rejected responses
+    The loss function uses this probability to compute gradients that push scores further apart. Simple argmax would give binary 1/0 feedback with no gradient signal for how much to adjust scores.
+    """
+
+    n_samples = len(scores_chosen)
+
+    # compute preference probs for all pairs
+    score_diffs = scores_chosen - scores_rejected # [n_samples] differences
+    print(f"\nscore_diffs: {score_diffs} \n")
+
+    probs = 1.0 / (1.0 + np.exp(-score_diffs))    # [n_samples] sigmoid of diffs
+    print(f"\nprobs: {probs} \n")
+
+    # log likelihood, sum of log probs
+    log_likelihood = np.sum(np.log(probs + 1e-10)) # Add epsilon to prevent log(0)
+    print(f"\nlog_likelihood: {log_likelihood} \n")
+
+
+    print(f"Score differences: {score_diffs[:3]}...")  # First 3 differences
+    print(f"Preference probs: {probs[:3]}...")  # First 3 probabilities
+    print(f"Total log likelihood: {log_likelihood:.4f}")
+    print(f"Average log likelihood: {log_likelihood/n_samples:.4f}")
+
+    return log_likelihood
+
+
+
+  def visualize_bradley_terry(self):
+    """Visualize the Bradley-Terry preference function"""
+    score_diffs = np.linspace(-5, 5, 100)  # Range of score differences
+    probs = 1.0 / (1.0 + np.exp(-score_diffs))  # Preference probabilities
+
+    plt.figure(figsize=(10, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(score_diffs, probs, 'b-', linewidth=2)
+    plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.5)  # 50% line
+    plt.axvline(x=0, color='r', linestyle='--', alpha=0.5)  # Equal scores line
+    plt.xlabel('Score Difference (z_i - z_j)')
+    plt.ylabel('P(o_i ≻ o_j)')
+    plt.title('Bradley-Terry Preference Function')
+    plt.grid(True, alpha=0.3)
+
+    # Add annotations for key points
+    plt.annotate('No preference', xy=(0, 0.5), xytext=(-2, 0.3),
+                arrowprops=dict(arrowstyle='->', color='red', alpha=0.5))
+    plt.annotate('Strong preference for i', xy=(3, 0.95), xytext=(1, 0.8),
+                arrowprops=dict(arrowstyle='->', color='green', alpha=0.5))
+
+    # Subplot 2: Effect of score magnitude
+    plt.subplot(1, 2, 2)
+    scores_i = np.array([0, 1, 2, 3, 4])  # Different score values for option i
+    scores_j = 1  # Fixed score for option j
+    probs = 1.0 / (1.0 + np.exp(-(scores_i - scores_j)))
+
+    plt.bar(range(len(scores_i)), probs, color=['red' if p < 0.5 else 'green' for p in probs])
+    plt.xlabel('Score of option i (score_j = 1)')
+    plt.ylabel('P(o_i ≻ o_j)')
+    plt.title('Preference vs Absolute Scores')
+    plt.xticks(range(len(scores_i)), scores_i)
+    plt.axhline(y=0.5, color='black', linestyle='--', alpha=0.5)
+    plt.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.show()
+
+"""# Bradley-Terry Preference Model Training
+
+**1. HUMAN LABELS**: Collect preference dataset (A > B), (C > D), (E > F)...
+   - *Provides ground truth supervision signal for training*
+<br>
+
+**2. INITIALIZE**: Reward model r_θ with random weights θ₀
+   - *Neural network that will learn to score outputs*
+   - θ is the set of all the learnable params on it
+<br>
+
+
+**3. FORWARD PASS**: r_θ(prompt, A) → score_A, r_θ(prompt, B) → score_B
+   - *Model evaluates each output, producing scalar scores*
+<br>
+
+
+**4. COMPUTE PROBABILITY**: P(A > B) = σ(score_A - score_B)
+   - *Converts score difference into preference probability*
+   - The order is crucial, its the ground truth preference: σ(score_A - score_B) gives P(A > B) while σ(score_B - score_A) gives P(B > A)
+   - Reversing the subtraction flips the meaning, so mismatching this during training would teach the model to prefer the wrong outputs.
+<br>
+
+
+**5. MEASURE ERROR**: Loss = -log P(human_choice)
+   - *Quantifies disagreement between model and human judgment*
+<br>
+
+
+**6. BACKPROP**: ∇Loss flows through network to compute ∇θ
+   - *Calculates how to adjust each parameter to reduce error*
+<br>
+
+
+**7. UPDATE**: θ_new = θ_old - learning_rate × ∇θ
+   - *Adjusts millions of parameters to better match human preferences*
+<br>
+
+
+**8. REPEAT**: Return to step 3 with next batch until convergence
+   - *Iteratively improves model through multiple passes over data*
+<br>
+
+
+**9. RESULT**: Trained r_θ that assigns higher scores to human-preferred outputs
+   - *Final model generalizes to evaluate novel outputs*
+<br>
+
+
+The reward model learns scoring patterns from human judgments, while humans provide the essential preference labels that define what constitutes "better" outputs - without human preferences, the model would have no training signal.
+"""
+
+bt_model = BradleyTerryModel()
+
+# Test single preference probability
+print("\nExample 1: Similar scores")
+bt_model.compute_preference_prob(score_i=2.1, score_j=2.0)
+
+print("\nExample 2: Large difference")
+bt_model.compute_preference_prob(score_i=5.0, score_j=1.0)
+
+print("\nExample 3: Negative scores")
+bt_model.compute_preference_prob(score_i=-1.0, score_j=-3.0)
+
+# Test log likelihood computation
+print("\n" + "-"*50)
+print("Computing log likelihood for preference dataset:")
+n_samples = 5
+scores_chosen = np.array([3.0, 2.5, 4.0, 1.5, 3.5])  # Scores for chosen options
+scores_rejected = np.array([1.0, 2.0, 1.0, 0.5, 3.0])  # Scores for rejected options
+
+log_likelihood = bt_model.compute_log_likelihood(scores_chosen, scores_rejected)
+
+# Visualize
+bt_model.visualize_bradley_terry()
 
