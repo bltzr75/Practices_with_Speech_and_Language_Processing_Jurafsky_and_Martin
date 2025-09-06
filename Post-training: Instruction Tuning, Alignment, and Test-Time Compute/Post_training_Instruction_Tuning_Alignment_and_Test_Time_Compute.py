@@ -925,3 +925,242 @@ log_likelihood = bt_model.compute_log_likelihood(scores_chosen, scores_rejected)
 # Visualize
 bt_model.visualize_bradley_terry()
 
+"""#Vanilla Reward Model Training with Numpy"""
+
+class VanillaRewardModel:
+  """
+  Simple reward model that learns to score outputs based on preferences
+  Uses Bradley-Terry formulation with gradient descent
+  """
+
+  def __init__(self, input_dim: int, hidden_dim: int=128):
+    self.input_dim = input_dim  # input features dim
+    self.hidden_dim = hidden_dim # Hidden layer dim
+
+    # init weigths with small non-zero random vals
+    # first layer
+    self.W1 = np.random.randn(input_dim, hidden_dim) * 0.01 # first layer weights  [D, H]
+    self.b1 = np.zeros(hidden_dim) # first layer bias [H]
+
+    # output layer
+    self.W2 = np.random.randn(hidden_dim,1) * 0.01 # output layer weights  [H,1]
+    self.b2 = np.zeros(1) # output layer bias [1]
+
+    print(f"Initialized Reward Model:")
+    print(f"  Input dim: {input_dim}")
+    print(f"  Hidden dim: {hidden_dim}")
+    print(f"  Parameters: {(input_dim * hidden_dim + hidden_dim + hidden_dim + 1):,}")
+
+  def forward(self, x:np.ndarray) -> Tuple[float, Dict[str, np.ndarray]]:
+    """
+    Forward pass to compute reward score
+    x: [input_dim] or [batch_size, input_dim] input features
+    Returns: scalar reward and intermediate activations
+    """
+
+    # Ensure 2d input
+    if x.ndim == 1:
+      print("\n1-dimensional input. Reshaping:\n")
+      print("Before: ", x, "\n")
+      x = x.reshape(1,-1) # [D] -> [1,D]
+      print("After: ", x, "\n")
+
+    # Layer 1: Linear + ReLU activation
+    z1 = x @ self.W1 + self.b1 # [B,D] @ [D,H] + [H] = [B,H]
+    h1 = np.maximum(0,z1) # ReLU activation: max(0,x)
+
+    # Layer 2: Linear (no activation, regression)
+    z2 = h1 @ self.W2 + self.b2 # [B,H] @ [H,1] + [H] = [B,H]
+    reward = z2.squeeze() # remove singleton dim
+
+    # store activations for backward pass
+    activations = {
+        'x': x,
+        'z1':z1,
+        'h1':h1,
+        'z2':z2,
+        'reward':reward
+    }
+
+    return reward, activations
+
+  def compute_bradley_terry_loss(self, x_chosen: np.ndarray, x_rejected: np.ndarray) -> Tuple[float, Dict]:
+    """
+    Compute loss using Bradley-Terry model
+    L = -log(σ(r(x_chosen) - r(x_rejected)))
+    """
+    # Forward pass for both options
+    r_chosen, act_chosen = self.forward(x_chosen)  # Reward and activations for chosen option
+    r_rejected, act_rejected = self.forward(x_rejected)  # Reward and activations for rejected option
+
+    # Compute preference probability with Bradley-Terry
+    score_diff = r_chosen - r_rejected
+    prob = 1.0 / (1.0 + np.exp(-score_diff)) # sigmoid of diff of scores made by the reward model weithgs
+
+    # Negative log likelihood loss
+    loss = -np.log(prob + 1e-10)  # Add epsilon for numerical stability
+
+    print(f"\nBradley-Terry Loss Computation:")
+    print(f"  r(chosen) = {r_chosen:.3f}")
+    print(f"  r(rejected) = {r_rejected:.3f}")
+    print(f"  Score diff = {score_diff:.3f}")
+    print(f"  P(chosen > rejected) = {prob:.4f}")
+    print(f"  Loss = -log(p) = {loss:.4f}")
+
+    return loss, {'act_chosen': act_chosen, 'act_rejected': act_rejected, 'prob': prob}
+
+  def backward(self, loss_info: Dict, learning_rate: float=0.01):
+    """
+    Backward pass using chain rule:
+
+    1. Divide problem into two parts:
+    - Gradient for the chosen example: ∂L/∂r_chosen = -(1-prob)
+    - Gradient for the rejected example: ∂L/∂r_rejected = +(1-prob)
+
+
+    2. Chain Rule:
+    - For the chosen:
+      grad_W2_chosen = grad_score_diff * h1.T        # ∂L/∂W2 = ∂L/∂r_chosen × ∂r_chosen/∂W2
+      grad_h1 = grad_score_diff * self.W2.T          # ∂L/∂h1 = ∂L/∂r_chosen × ∂r_chosen/∂h1
+      grad_z1 = grad_h1 * (z1 > 0)                   # ∂L/∂z1 = ∂L/∂h1 × ∂h1/∂z1 (ReLU derivative)
+      grad_W1_chosen = x.T @ grad_z1                 # ∂L/∂W1 = ∂L/∂z1 × ∂z1/∂W1
+
+    - For the rejected:
+      # Same computation but with -grad_score_diff (opposite sign)
+      grad_W2_rejected = grad_score_diff_rejected * h1_rejected.T # [H, 1]   ∂L/∂W2_rejected = ∂L/∂r_rejected × ∂r_rejected/∂W2
+      grad_h1_rejected = grad_score_diff_rejected * self.W2.T     # [1, H]   ∂L/∂h1_rejected = ∂L/∂r_rejected × ∂r_rejected/∂h1
+      grad_z1_rejected = grad_h1_rejected * (z1_rejected > 0)     # [1, H]  ∂h1/∂z1 = 1 if z1 > 0, else 0 (ReLU derivative)
+      grad_W1_rejected = x_rejected.T @ grad_z1_rejected          # [D, H]  ∂L/∂W1_rejected = ∂L/∂z1_rejected × ∂z1_rejected/∂W1
+
+
+
+    3. Combine gradients and update:
+      self.W2 -= learning_rate * (grad_W2_chosen + grad_W2_rejected)
+      self.W1 -= learning_rate * (grad_W1_chosen + grad_W1_rejected)
+
+    """
+
+    prob = loss_info['prob']
+    act_chosen = loss_info['act_chosen']
+    act_rejected = loss_info['act_rejected']
+
+    # Gradient of loss w.r.t score difference
+    grad_score_diff = -(1 - prob)  # ∂L/∂(r_chosen - r_rejected)
+
+    print(f"\nGradient computation:")
+    print(f"  dL/d(score_diff) = {grad_score_diff:.4f}")
+    print(f"  Current weights (sample): W1[0,0] = {self.W1[0,0]:.6f}")
+
+    # Compute gradients for chosen example (positive contribution)
+    grad_W2_chosen, grad_W1_chosen = self._compute_gradients(act_chosen, grad_score_diff)
+
+    # Compute gradients for rejected example (negative contribution)
+    grad_W2_rejected, grad_W1_rejected = self._compute_gradients(act_rejected, -grad_score_diff)
+
+    # Update weights using combined gradients
+    self.W2 -= learning_rate * (grad_W2_chosen + grad_W2_rejected)
+    self.W1 -= learning_rate * (grad_W1_chosen + grad_W1_rejected)
+
+    print(f"  Updated weights (sample): W1[0,0] = {self.W1[0,0]:.6f}\n")
+
+  def _compute_gradients(self, activations: Dict, grad_reward: float):
+    """Compute gradients for one example using chain rule"""
+    x = activations['x']
+    h1 = activations['h1']
+    z1 = activations['z1']
+
+    # Gradient w.r.t W2: ∂L/∂W2 = ∂L/∂reward × ∂reward/∂W2
+    grad_W2 = grad_reward * h1.T  # [H, 1]
+
+    # Gradient w.r.t h1: ∂L/∂h1 = ∂L/∂reward × ∂reward/∂h1
+    grad_h1 = grad_reward * self.W2.T  # [1, H]
+
+    # Gradient through ReLU: ∂h1/∂z1 = 1 if z1 > 0, else 0
+    grad_z1 = grad_h1 * (z1 > 0)  # [1, H]
+
+    # Gradient w.r.t W1: ∂L/∂W1 = ∂L/∂z1 × ∂z1/∂W1
+    grad_W1 = x.T @ grad_z1  # [D, H]
+
+    return grad_W2, grad_W1
+
+  def train_on_preferences(self, preference_pairs: List[Tuple[np.ndarray, np.ndarray]],
+                          epochs: int = 10, learning_rate: float = 0.01):
+    """Train reward model on preference data"""
+    print(f"\nTraining Reward Model on {len(preference_pairs)} preference pairs")
+    print(f"Epochs: {epochs}, Learning rate: {learning_rate}")
+
+    losses = []
+
+    for epoch in range(epochs):
+
+      epoch_loss = 0
+      for x_chosen, x_rejected in preference_pairs:
+        loss, loss_info  = self.compute_bradley_terry_loss(x_chosen, x_rejected)
+        self.backward(loss_info, learning_rate)
+        epoch_loss += loss
+
+      epoch_loss_averaged = epoch_loss/len(preference_pairs)
+      losses.append(epoch_loss_averaged )
+
+      if epoch % 2 == 0:
+          print(f"Epoch {epoch}: Averaged loss = {epoch_loss_averaged:.4f}")
+
+    return losses
+
+"""## Test vanilla reward model"""
+
+# Create reward model
+reward_model = VanillaRewardModel(input_dim=10, hidden_dim=32)
+
+# Create synthetic preference data
+n_pairs = 20
+input_dim = 10
+preference_pairs = []
+
+for _ in range(n_pairs):
+  # Generate two random feature vectors
+  x1 = np.random.randn(input_dim)  # Option 1 features
+  x2 = np.random.randn(input_dim)  # Option 2 features
+
+  # Simulate preference: prefer option with larger norm (arbitrary choice)
+  if np.linalg.norm(x1) > np.linalg.norm(x2):
+    preference_pairs.append((x1, x2))  # x1 is chosen
+  else:
+    preference_pairs.append((x2, x1))  # x2 is chosen
+
+print(f"Created {len(preference_pairs)} synthetic preference pairs")
+
+# Test single forward pass
+test_input = np.random.randn(input_dim)
+reward, activations = reward_model.forward(test_input)
+print(f"\nTest forward pass:")
+print(f"  Input shape: {test_input.shape}")
+print(f"  Output reward: {reward:.4f}")
+
+# Test loss computation
+x_chosen, x_rejected = preference_pairs[0]
+loss, loss_info = reward_model.compute_bradley_terry_loss(x_chosen, x_rejected)
+
+# Train the model
+print("\n" + "-"*50)
+losses = reward_model.train_on_preferences(preference_pairs[:10], epochs=10, learning_rate=0.1)
+
+# Plot training curve
+plt.figure(figsize=(8, 4))
+plt.plot(losses, 'b-', marker='o')
+plt.xlabel('Epoch')
+plt.ylabel('Average Bradley-Terry Loss')
+plt.title('Reward Model Training')
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# Test learned preferences
+print("\n" + "-"*50)
+print("Testing learned reward model:")
+test_chosen, test_rejected = preference_pairs[15]  # Use unseen pair
+r_chosen, _ = reward_model.forward(test_chosen)
+r_rejected, _ = reward_model.forward(test_rejected)
+print(f"Reward(chosen): {r_chosen:.4f}")
+print(f"Reward(rejected): {r_rejected:.4f}")
+print(f"Correctly ranked: {r_chosen > r_rejected}")
+
