@@ -1164,3 +1164,246 @@ print(f"Reward(chosen): {r_chosen:.4f}")
 print(f"Reward(rejected): {r_rejected:.4f}")
 print(f"Correctly ranked: {r_chosen > r_rejected}")
 
+"""# Vanilla Direct Preference Optimization (DPO)"""
+
+class VanillaDPO:
+  """
+  Direct preference optimization without wxplcit reward model
+  Optimize preferences directly using the same policy
+  """
+
+  def __init__(self, vocab_size: int, hidden_size: int, beta:float=0.1):
+    self.vocab_size = vocab_size
+    self.hidden_size = hidden_size
+    self.beta = beta # KL penalty coefficient (controls divergence from reference policy (sft model before dpo))
+
+    # initialize policy params (simplified LM)
+    self.embedding = np.random.randn(vocab_size, hidden_size) * 0.01
+    self.output_layer = np.random.randn(hidden_size, vocab_size) * 0.01 # unembedding
+
+    # store reference policy (frozen copy of initial weights)
+    self.ref_embedding = self.embedding.copy()    # reference embedding
+    self.ref_output    = self.output_layer.copy() # reference output layer
+
+    print(f"Initialized DPO Model:")
+    print(f"  Vocab size: {vocab_size}")
+    print(f"  Hidden size: {hidden_size}")
+    print(f"  Beta (KL coefficient): {beta}")
+    print(f"  DPO Loss: L = -log(σ(β·log(π_θ(y_w|x)/π_ref(y_w|x)) - β·log(π_θ(y_l|x)/π_ref(y_l|x))))")
+
+
+  def get_log_probs(self, tokens: np.ndarray, use_reference:bool = False) -> np.ndarray:
+    """
+    Compute log probs of tokens under the policy
+    tokens: [seq_len] token indices
+    use_reference: whether to use reference policy or current policy
+    """
+
+    # select which policy to use
+    if use_reference:               # reference/original policy
+      embedding = self.ref_embedding
+      output = self.ref_output
+    else:                           # policy to optimize
+      embedding = self.embedding
+      output = self.output_layer
+
+    # simple forward pass (no attn for simplicity)
+    seq_len = len(tokens)
+    log_probs = np.zeros(seq_len)
+
+
+    for t in range(seq_len):
+      # get embedding
+      if t == 0: # first token
+        hidden = np.mean(embedding, axis=0) # [H] use as ctxt the average embedding over vocab for first token
+      else:
+        # use prev token as ctxt
+        hidden = embedding[tokens[t-1]]
+
+      # compute logits for all tkns
+      logits = hidden @ output # Unembed [H] @ [H, V] = [V]
+
+      # compute log prob of actual token
+      log_probs_t = logits - np.log(np.sum(np.exp(logits))) # log softmax
+      print(f"\nlog_probs_t: {log_probs_t[:5]}\n")
+
+      log_probs[t] = log_probs_t[tokens[t]]
+      print(f"\nlog_probs[t]: {log_probs[t]}\n")
+
+    return log_probs
+
+
+  def compute_dpo_loss(self, prompt: np.ndarray, chosen: np.ndarray, rejected:np.ndarray) -> Tuple[float, Dict] :
+    """
+    Compute DPO loss for a preference pair
+    DPO optimizes: P(chosen > rejected) using policy ratios
+    """
+
+    # get log probs under current policy
+    log_prob_chosen = np.sum(self.get_log_probs(chosen, use_reference=False))
+    log_prob_rejected = np.sum(self.get_log_probs(rejected, use_reference=False))
+
+    # get log probs under reference policy
+    ref_log_prob_chosen = np.sum(self.get_log_probs(chosen, use_reference=True))
+    ref_log_prob_rejected = np.sum(self.get_log_probs(rejected, use_reference=True))
+
+    # Compute log ratios (the key DPO transformation)
+    log_ratio_chosen = log_prob_chosen - ref_log_prob_chosen # log(π_θ/π_ref) for chosen
+    print(f"\nlog_ratio_chosen: {log_ratio_chosen}\n")
+
+    log_ratio_rejected = log_prob_rejected - ref_log_prob_rejected # log(π_θ/π_ref) for rejected
+    print(f"\nlog_ratio_rejected: {log_ratio_rejected}\n")
+
+
+    # DPO loss: -log(σ(β(log_ratio_chosen - log_ratio_rejected)))
+    # This implicitly optimizes the Bradley-Terry objective without reward model
+
+    logit_diff = self.beta * (log_ratio_chosen - log_ratio_rejected)  # Scaled difference
+    print(f"\nlogit_diff:\n {logit_diff}\n")
+
+    loss = -np.log(1.0 / (1.0 + np.exp(-logit_diff)) + 1e-10 ) # Negative log sigmoid
+    print(f"\nloss: {loss}\n")
+
+
+    print(f"\n\nDPO Loss Computation:")
+    print(f"  π_θ(chosen): {log_prob_chosen:.3f}, π_ref(chosen): {ref_log_prob_chosen:.3f}")
+    print(f"  π_θ(rejected): {log_prob_rejected:.3f}, π_ref(rejected): {ref_log_prob_rejected:.3f}")
+    print(f"  Log ratio (chosen): {log_ratio_chosen:.3f}")
+    print(f"  Log ratio (rejected): {log_ratio_rejected:.3f}")
+    print(f"  Preference logit: β(r_w - r_l) = {logit_diff:.3f}")
+    print(f"  Implicit preference prob: {1.0/(1.0 + np.exp(-logit_diff)):.4f}")
+    print(f"  DPO Loss: {loss:.4f}")
+
+
+    # Compute Kullback–Leibler divergence for monitoring. Taking the average over the chosen and rejected outputs it’s not a full KL calculation over the whole distribution, but a simple approximation to track during training.
+    # On average, how far is the new policy drifting away from the reference policy when generating chosen vs. rejected samples
+    kl_chosen = log_ratio_chosen # KL term for chosen
+    kl_rejected = log_ratio_rejected # KL term for rejected
+
+    avg_kl = (kl_chosen + kl_rejected) / 2  # Average KL
+    print(f"  KL divergence (avg): {avg_kl:.4f}\n\n")
+
+
+
+    return loss, {
+      'log_ratio_chosen': log_ratio_chosen,
+      'log_ratio_rejected': log_ratio_rejected,
+      'implicit_reward_chosen': log_ratio_chosen / self.beta,  # Implicit reward. In Direct Preference Optimization (DPO), there’s no explicit reward model. Instead, the difference between the policy and the reference log-probabilities serves as a proxy for reward.
+      'implicit_reward_rejected': log_ratio_rejected / self.beta,  # Implicit reward. It doesn’t come from a trained reward model (like in RLHF). It’s derived directly from how much more (or less) likely the policy makes an output compared to the reference policy.
+    }
+
+  def update_weights(self, loss_info: Dict, learning_rate: float = 0.01):
+    """Simplified weight update"""
+
+    # Get implicit rewards
+    r_chosen   = loss_info['implicit_reward_chosen']
+    r_rejected = loss_info['implicit_reward_rejected']
+
+    # Simple heuristic update
+    update_magnitude = learning_rate * (r_chosen - r_rejected)
+
+    # small perturbation to weights
+    self.embedding    += np.random.randn(*self.embedding.shape)    * update_magnitude * 0.001
+    self.output_layer += np.random.randn(*self.output_layer.shape) * update_magnitude * 0.001
+
+    print(f"\nWeight update:")
+    print(f"  Update magnitude: {update_magnitude:.6f}")
+    print(f"  Embedding change norm: {np.linalg.norm(self.embedding - self.ref_embedding):.6f}")
+
+  def visualize_dpo_objective(self):
+    """Visualize the DPO objective function"""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Plot 1: Implicit reward vs log ratio
+    log_ratios = np.linspace(-2, 2, 100)
+    implicit_rewards = log_ratios / self.beta  # r(x,y) = log(π/π_ref)/β
+
+    axes[0].plot(log_ratios, implicit_rewards, 'b-', linewidth=2)
+    axes[0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[0].axvline(x=0, color='k', linestyle='--', alpha=0.3)
+    axes[0].set_xlabel('Log Ratio: log(π_θ/π_ref)')
+    axes[0].set_ylabel('Implicit Reward: r(x,y)')
+    axes[0].set_title(f'DPO Implicit Reward (β={self.beta})')
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot 2: Preference probability vs reward difference
+    reward_diffs = np.linspace(-3, 3, 100)
+    preference_probs = 1.0 / (1.0 + np.exp(-self.beta * reward_diffs))
+
+    axes[1].plot(reward_diffs, preference_probs, 'g-', linewidth=2)
+    axes[1].axhline(y=0.5, color='r', linestyle='--', alpha=0.5)
+    axes[1].axvline(x=0, color='r', linestyle='--', alpha=0.5)
+    axes[1].set_xlabel('Reward Difference: r_chosen - r_rejected')
+    axes[1].set_ylabel('P(chosen > rejected)')
+    axes[1].set_title('DPO Preference Function')
+    axes[1].grid(True, alpha=0.3)
+
+    # Plot 3: Loss landscape
+    log_ratio_diffs = np.linspace(-3, 3, 100)
+    losses = -np.log(1.0 / (1.0 + np.exp(-self.beta * log_ratio_diffs)) + 1e-10)
+
+    axes[2].plot(log_ratio_diffs, losses, 'r-', linewidth=2)
+    axes[2].set_xlabel('Log Ratio Difference')
+    axes[2].set_ylabel('DPO Loss')
+    axes[2].set_title('DPO Loss Function')
+    axes[2].grid(True, alpha=0.3)
+
+    # Add annotations
+    axes[2].annotate('High loss when\nrejected > chosen',
+                    xy=(-2, losses[20]), xytext=(-1.5, 3),
+                    arrowprops=dict(arrowstyle='->', color='red', alpha=0.5))
+
+    plt.tight_layout()
+    plt.show()
+
+"""## Test DPO"""
+
+dpo_model = VanillaDPO(vocab_size=100, hidden_size=32, beta=0.1)
+
+# Create simple preference examples (token sequences)
+prompt = np.array([1, 2, 3])  # Simple prompt
+chosen = np.array([1, 2, 3, 4, 5, 6])  # Chosen continuation
+rejected = np.array([1, 2, 3, 7, 8, 9])  # Rejected continuation
+
+print(f"Prompt tokens: {prompt}")
+print(f"Chosen tokens: {chosen}")
+print(f"Rejected tokens: {rejected}")
+
+# Compute DPO loss
+loss, loss_info = dpo_model.compute_dpo_loss(prompt, chosen, rejected)
+
+# Update weights
+dpo_model.update_weights(loss_info, learning_rate=0.1)
+
+# Visualize DPO objective
+dpo_model.visualize_dpo_objective()
+
+# Train on multiple preference pairs
+print("\n" + "="*50)
+print("Training DPO on preference data:")
+losses = []
+for i in range(10):
+  # Generate random preference pair
+  chosen = np.random.randint(0, 100, size=np.random.randint(5, 10))
+  rejected = np.random.randint(0, 100, size=np.random.randint(5, 10))
+
+  loss, loss_info = dpo_model.compute_dpo_loss(prompt, chosen, rejected)
+  dpo_model.update_weights(loss_info, learning_rate=0.05)
+  losses.append(loss)
+
+  if i % 3 == 0:
+    print(f"Step {i}: Loss = {loss:.4f}")
+
+plt.figure(figsize=(8, 4))
+plt.plot(losses, 'b-', marker='o')
+plt.xlabel('Training Step')
+plt.ylabel('DPO Loss')
+plt.title('DPO Training Progress')
+plt.grid(True, alpha=0.3)
+plt.show()
+
+
+print("both models with the same parameters and never let them diverge")
+print("the reference model should be frozen")
+print("update stepo of weights inneficient")
+
