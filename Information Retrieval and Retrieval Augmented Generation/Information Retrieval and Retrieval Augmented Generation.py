@@ -251,7 +251,168 @@ feature_names = retriever.vectorizer.get_feature_names_out()
 for idx, feature in enumerate(feature_names):
     print(f"Column {idx}: '{feature}'")
 
-
 test_query = Query(query_id="q1", text="battle war")
 results = retriever.search(test_query, top_k=3)
+
+"""### Display TF-IDF matrix"""
+
+# make df
+tfidf_df = pd.DataFrame(
+  retriever.tfidf_matrix.toarray(),
+  columns=feature_names,
+  index=[f"Doc{i}" for i in range(len(shakespeare_docs))]
+)
+tfidf_df
+
+"""# BM25 Scorer"""
+
+class BM25Scorer:
+  """BM25 scoring with parameter tuning"""
+
+  def __init__(self, collection: DocumentCollection, k1: float=1.2, b:float=0.75):
+    """
+    k1: controls term frequency saturation (typically 1.2-2.0). Enough to give score to a repeated word but not making a word repeated 100 times 100 times more important.
+    b: controls length normalization (0=no normalization, 1=full normalization). Regularization over too large docs.
+    """
+
+    self.collection = collection
+    self.k1 = k1 # Term frequency saturation param
+    self.b = b   # Length normalization param
+    self.doc_lengths = {} # Store doc lengths
+    self.avg_doc_length = 0 # Avg doc length
+    self.doc_freqs = defaultdict(int) # doc freqs per term
+    self.N = len(collection.documents) # total num of docs
+    self.term_freqs = {} # Term freqs per doc
+
+    self._compute_statistics()
+
+
+  def _compute_statistics(self):
+    """Copmute doc statistics for BM25"""
+
+    total_length = 0
+
+    for doc in self.collection.documents:
+      tokens = doc.get_tokens()
+      doc_length = len(tokens)
+      self.doc_lengths[doc.doc_id] = doc_length
+      total_length += doc_length
+
+      # Count term freq for this doc
+      term_freq = defaultdict(int)
+      unique_terms = set()
+      for token in tokens:
+        term_freq[token] += 1 # add 1 on occurence
+        unique_terms.add(token)
+
+      self.term_freqs[doc.doc_id] = term_freq
+
+      # Update doc frequencies
+      for term in unique_terms:
+        self.doc_freqs[term] += 1 # Increment doc freq per term
+
+
+    # Compute avg length
+    self.avg_doc_length = total_length / self.N
+
+
+    print(f"BM25 Statistics:")
+    print(f"  Documents: {self.N}")
+    print(f"  Avg doc length: {self.avg_doc_length:.2f}")
+    print(f"  Unique terms: {len(self.doc_freqs)}")
+
+
+  def score(self, query: Query, doc: Document) -> float:
+    """
+    Compute BM25 score for query-document pair.
+
+    BM25(q,d) = Σ IDF(t) * (tf(t,d) * (k1 + 1)) / (tf(t,d) + k1 * (1 - b + b * |d|/avgdl))
+
+    Where for each term t in query q:
+      - IDF(t) = log((N - df(t) + 0.5) / (df(t) + 0.5)) — inverse document frequency
+      - tf(t,d) = frequency of term t in document d
+      - |d| = length of document d (number of terms)
+      - avgdl = average document length in collection
+      - k1 = term frequency saturation parameter (default 1.2). Keeps repeated more important but not in a linear scale per occureance.
+      - b = length normalization parameter (0=none, 1=full, default 0.75). Penalizes too long docs.
+
+    The formula balances term importance (IDF) with normalized term frequency,
+    preventing bias toward longer documents while rewarding term repetition up to a limit.
+    """
+
+    score = 0.0
+    query_terms = query.get_tokens() # query terms
+    doc_length = self.doc_lengths[doc.doc_id]
+
+    for term in query_terms:
+      if term not in self.doc_freqs:
+        continue # skip terms not in the collection
+
+
+      # Compute IDF: log((N-df + 0.5)/ (df + 0.5) )
+
+      df = self.doc_freqs[term] # Doc freq
+
+      idf = math.log((self.N - df + 0.5) / (df + 0.5)) # Inv Doc Freq with smoothing
+      print("\n\n\nidf = math.log((self.N - df + 0.5) / (df + 0.5))\n")
+      print(f"{idf:.3f} = math.log(({self.N} - {df} + 0.5) / ({df} + 0.5))\n")
+
+
+      # Get term freq in doc
+      tf = self.term_freqs[doc.doc_id].get(term, 0)
+      print(f"tf = {tf}\n\n")
+
+      #Compute normalized term freq
+      # tf_normalized (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * |d| / avgdl ))
+
+      norm_factor = 1 - self.b + self.b * (doc_length / self.avg_doc_length)
+      tf_component = (tf * (self.k1 + 1 )) / (tf + self.k1 * norm_factor) # Normalized TF
+
+
+      # Add to score
+      term_score = idf * tf_component # idf * normalized tf
+      score += term_score
+
+      if tf > 0:  # Only print for terms that appear in document
+        print(f"    Term '{term}': tf={tf}, df={df}, idf={idf:.3f}, contribution={term_score:.3f}")
+        print("\n", "-"*50,"\n")
+
+    return score
+
+
+  def search(self, query: Query, top_k: int = 3) -> List[Tuple[Document, float]]:
+    """Search documents using BM25 scoring"""
+
+    scores = []
+
+    print(f"\nBM25 Search for: '{query.text}'")
+
+    for doc in self.collection.documents:
+      score = self.score(query, doc) # compute bm25 score
+      scores.append((doc, score))
+      print(f"  '{doc.title}': {score:.4f}")
+
+    # Sort desc by score
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    # Return top k
+    return scores[:top_k]
+
+# Test BM25 scorer
+bm25 = BM25Scorer(collection, k1=1.2, b=0.75)
+query = Query(query_id="q2", text="battle fool")
+bm25_results = bm25.search(query, top_k=3)
+
+
+
+print("\n\n")
+print("\nThe negative IDF -0.847 here means these terms are so common they're actually penalizing the scores rather than helping.")
+
+print("\nHigh IDF = term is RARE, appears in few documents -> very distinctive/important")
+print("\nLow/Negative IDF = term is COMMON, appears in many documents -> not distinctive\n")
+
+
+print("\nTop BM25 Results:")
+for rank, (doc, score) in enumerate(bm25_results, 1):
+    print(f"  {rank}. {doc.title}: {score:.4f}")
 
