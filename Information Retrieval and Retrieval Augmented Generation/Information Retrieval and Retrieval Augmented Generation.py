@@ -416,3 +416,107 @@ print("\nTop BM25 Results:")
 for rank, (doc, score) in enumerate(bm25_results, 1):
     print(f"  {rank}. {doc.title}: {score:.4f}")
 
+"""# Inverted Index Implementation"""
+
+class InvertedIndex:
+  """Efficient inverted index"""
+
+  def __init__(self):
+    self.index = defaultdict(list) # term -> list of (doc_id, positions)
+    self.doc_lengths = {} #  doc_id -> document lenght
+    self.doc_norms = {} # dog_id -> L2 norm for cos sim
+
+  def add_document(self, doc: Document):
+    """Add doc to inverted index"""
+
+    tokens = doc.get_tokens()
+    self.doc_lengths[doc.doc_id] = len(tokens)
+
+    # track term freq for L2 norm
+    term_freqs = defaultdict(int)
+
+    # build postings listwith positions
+    for position, token in enumerate(tokens):
+      self.index[token].append((doc.doc_id, position))
+      term_freqs[token] += 1
+
+    # compute l2 norm for doc vector
+    norm = math.sqrt(sum(tf**2 for tf in term_freqs.values()))
+    self.doc_norms[doc.doc_id] = norm
+
+    print(f"\nIndexed '{doc.title}': {len(tokens)} tokens, {len(term_freqs)} unique terms")
+
+
+  def search_term(self, term: str) -> List[Tuple[str, List[int]]]:
+    """Search for docs containing a term"""
+
+    # if not contained term in docs retrieve empty list
+    term = term.lower()
+    if term not in self.index:
+      return []
+
+    # group positions by doc
+    doc_positions = defaultdict(list)
+    for doc_id, position in self.index[term]:
+      doc_positions[doc_id].append(position) # group positions by doc
+
+    return list(doc_positions.items()) # return (doc_id, positions) pairs
+
+
+  def boolean_and(self,terms: List[str]) -> List[str]:
+    """Find docs containing ALL terms (AND operation)"""
+    if not terms:
+      return []
+
+
+    # get doc sets for each term
+    doc_sets = []
+    for term in terms:
+      docs = set(doc_id for doc_id, _ in self.index[term.lower()])
+      doc_sets.append(docs)
+
+
+    # intersect all docs sets
+    result = doc_sets[0] # start with tfirst set
+    for doc_set in doc_sets[1:]:
+      result = result.intersection(doc_set) # intersect subsequents
+
+    return list(result)
+
+
+  def boolean_or(self, terms: List[str]) -> List[str]:
+    """Find documents containing ANY term (OR operation)"""
+
+    result = set()
+    for term in terms:
+      docs = set( doc_id for doc_id, _ in self.index[term.lower()] )
+      result = result.union(docs)
+
+    return list(result)
+
+
+  def print_index(self):
+      """Print inverted index structure"""
+      print("\nInverted Index:")
+      for term in sorted(self.index.keys()):
+          postings = self.index[term]
+          doc_freq = len(set(doc_id for doc_id, _ in postings))  # Count unique documents
+          print(f"\n  '{term}' -> df={doc_freq}, postings={postings}")  # Show first 5 postings
+
+"""## Test Inverted Index"""
+
+inv_index = InvertedIndex()
+for doc in collection.documents:
+  inv_index.add_document(doc)
+
+
+inv_index.print_index()
+
+# Test boolean search
+print("\nBoolean Search Tests:")
+print(f"  Documents with 'battle': {inv_index.search_term('battle')}")
+print(f"  Documents with 'battle' AND 'fool': {inv_index.boolean_and(['battle', 'fool'])}")
+print(f"  Documents with 'love' OR 'war': {inv_index.boolean_or(['love', 'war'])}")
+
+
+
