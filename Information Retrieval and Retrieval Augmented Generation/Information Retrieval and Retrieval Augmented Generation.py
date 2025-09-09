@@ -518,5 +518,131 @@ print(f"  Documents with 'battle': {inv_index.search_term('battle')}")
 print(f"  Documents with 'battle' AND 'fool': {inv_index.boolean_and(['battle', 'fool'])}")
 print(f"  Documents with 'love' OR 'war': {inv_index.boolean_or(['love', 'war'])}")
 
+"""# Dense Retrieval with BERT and PEFT"""
 
+class DenseBERTRetriever:
+  """Dense retrieval using BERT embeddings with PEFT for efficiency"""
+
+  def __init__(self, model_name:str = 'bert-base-uncased', use_peft: bool = True):
+    self.device = device
+    self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Load model with optional 8-bit quantization
+    if use_peft and torch.cuda.is_available():
+      bnb_config = BitsAndBytesConfig(
+          load_in_8bit = True,
+          bnb_8bit_compute_dtype=torch.float16,
+          bnb_8bit_quant_type="nf8", # Quantization type selected: NF8 (Normal Float 8-bit)
+          bnb_8bit_use_double_quant=True # # Double quantization for more memory savings
+          )
+
+      self.model = AutoModel.from_pretrained(
+          model_name,
+          quantization_config = bnb_config,
+          device_map="auto" # It intelligently distributes the model's parameters across your system's resources, prioritizing faster devices like GPUs.
+      )
+
+      # prepare for k-bit training
+      self.model = prepare_model_for_kbit_training(self.model)
+
+      # Add LoRA adapters for fine-tuning
+      peft_config = LoraConfig(
+          r=8,
+          lora_alpha=32, # scaling param
+          target_modules=["query", "value"],  # Attention Layers
+          lora_dropout=0.1,
+          bias = "none",
+          task_type = TaskType.FEATURE_EXTRACTION, # task type for embeddings
+      )
+
+      self.model = get_peft_model(self.model, peft_config)  # Returns a Peft model object from a model and a config
+
+      self.model.print_trainable_parameters() # show parameter efficiency
+
+    else:
+      self.model = AutoModel.from_pretrained(model_name).to(self.device)
+
+
+    self.doc_embeddings = {} # Cache for doc embeddings
+
+
+
+  def encode_text(self, text:str) -> torch.Tensor:
+    """Encode text to dense vector using BERT [CLS] special token"""
+
+    # Tokenize text
+    inputs = self.tokenizer(
+        text,
+        padding=True, # pad to max length in batch
+        truncation=True,  # truncate to max length
+        max_length=512, # max length
+        return_tensors="pt"
+    ).to(self.device)
+
+
+    # get BERT outputs
+    with torch.no_grad(): # we will do inference to only extract the embeddings for the indexing/search
+      outputs = self.model(**inputs) # forward pass [1, sequence_length, 768]
+
+
+    # using [CLS] token embedding as doc representation
+    cls_embedding = outputs.last_hidden_state[:,0,:] # [batch_size, seq_length, hidden_size] -> [batch_size, hidden_size] so it is [1, 768]
+
+    print(f"Encoded '{text[:30]}...': shape={cls_embedding.shape}")
+    return cls_embedding.cpu()  # Move to CPU for storage
+
+
+  def index_documents(self, documents: List[Document]):
+    """Pre-compute and cache doc embeddings"""
+
+    print(f"\nIndexing {len(documents)} documents with BERT...")
+
+    for doc in documents:
+      embedding = self.encode_text(doc.content)
+      self.doc_embeddings[doc.doc_id] = embedding # cache embedding
+
+
+    # stack all the embeddings for efficient similarity computation
+    self.doc_matrix = torch.stack(list(self.doc_embeddings.values())).squeeze(1) # squeeze(1) removes dimension at index 1 so if it has size 1: [n_docs, 1, 768] -> [n_docs, 768]
+    print(f"Document matrix shape: {self.doc_matrix.shape}")
+    print(f"Document matrix:\n {self.doc_matrix[:,:20]}")
+
+
+  def search(self, query: Query, top_k:int = 3) -> List[Tuple[str,float]]:
+    """Search using the dense vector similarity"""
+
+    # Encode query
+    query_embedding = self.encode_text(query.text).squeeze(0) # output shape [hidden_size]
+
+    # compute cos sim
+    # norm vectors
+    query_norm = query_embedding / query_embedding.norm() # L2 normalization
+    doc_norms = self.doc_matrix / self.doc_matrix.norm(dim=1, keepdim=True) # normalize each doc
+
+    # compute dot product
+    similarities = torch.matmul(doc_norms, query_norm) # [n_docs]
+
+    print(f"\nDense search for: '{query.text}'")
+    print(f"Query embedding shape: {query_embedding.shape}")
+    print(f"Similarities: {similarities}")
+
+    # get top-k indices
+    top_scores, top_indices = torch.topk(similarities, min(top_k, len(similarities)))
+
+    results = []
+    doc_ids = list(self.doc_embeddings.keys())
+    for idx, score in zip(top_indices, top_scores):
+      doc_id = doc_ids[idx]
+      results.append((doc_id, score.item()))
+      print(f"  {doc_id}: {score.item():.4f}")
+
+"""## Testing Dense Retrieval
+
+"""
+
+dense_retriever = DenseBERTRetriever(use_peft=torch.cuda.is_available())
+dense_retriever.index_documents(collection.documents)
+
+query = Query(query_id="q3", text="war battle")
+dense_results = dense_retriever.search(query, top_k=3)
 
