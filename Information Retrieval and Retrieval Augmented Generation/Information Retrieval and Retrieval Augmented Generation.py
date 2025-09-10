@@ -29,6 +29,10 @@ import math
 # Pydantic for data validation
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
+from google.colab import userdata
+HF_TOKEN= userdata.get('test_hf_1') # HF token
+
+
 # HuggingFace ecosystem
 from transformers import (
     AutoTokenizer,
@@ -518,7 +522,90 @@ print(f"  Documents with 'battle': {inv_index.search_term('battle')}")
 print(f"  Documents with 'battle' AND 'fool': {inv_index.boolean_and(['battle', 'fool'])}")
 print(f"  Documents with 'love' OR 'war': {inv_index.boolean_or(['love', 'war'])}")
 
-"""# Dense Retrieval with BERT and PEFT"""
+"""# Examples of Different types of Embeddings
+
+**Query:**  
+"Where is the Louvre?"  
+
+**Document:**  
+"The Louvre Museum is located in Paris, France"  
+
+---
+
+## 1. Cross-Encoder (Full BERT)
+
+**Input:**  
+`[CLS] Where is the Louvre? [SEP] The Louvre Museum is located in Paris, France [SEP]`
+
+**Process:**  
+- Single BERT encoder processes query and document together.  
+- Produces a single scalar score.  
+
+**Output:**  
+- Shape: `[1]`  
+- Storage: Cannot pre-store (must re-encode for each query-document pair).  
+
+---
+
+## 2. Bi-Encoder
+
+**Input:**  
+- Query Encoder (BERTQ): `[CLS] Where is the Louvre?`  
+- Document Encoder (BERTD): `[CLS] The Louvre Museum is located...`
+
+**Process:**  
+- Encode separately into vectors.  
+
+**Output:**  
+- Query vector: `[768 dims]`  
+- Document vector: `[768 dims]`  
+- Example:  
+  - Query: `[-0.23, 0.41, ..., 0.87]`  
+  - Document: `[0.15, -0.62, ..., 0.34]`  
+- Score: `dot_product(query_vec, doc_vec) -> scalar`  
+- Shape: `Query=[768], Doc=[768]`  
+- Storage: Pre-store all document vectors.  
+
+---
+
+## 3. ColBERT
+
+**Input Tokens:**  
+- Query: `[Q] Where is the Louvre [PAD] ...`  
+- Document: `[D] The Louvre Museum is located in Paris France`
+
+**Process:**  
+- Each token encoded separately with BERT + linear projection.  
+
+**Output:**  
+- Query matrix: `[32 × 128]`  
+- Document matrix: `[9 × 128]`  
+- Example (partial):  
+  - Query: `[q_Q], [q_Where], [q_is], [q_the], [q_Louvre], [q_PAD] ...`  
+  - Document: `[d_The], [d_Louvre], [d_Museum], [d_is], [d_located], [d_in], [d_Paris], [d_France]`  
+
+**Scoring (MaxSim):**  
+- For each query token, take maximum similarity with any document token.  
+  - `q_Where -> max(d_located) = 0.82`  
+  - `q_is -> max(d_is) = 0.95`  
+  - `q_Louvre -> max(d_Louvre) = 0.99`  
+- Ignore padding tokens.  
+- Final score = sum of max similarities.  
+
+**Storage:**  
+- Pre-store all document token matrices.  
+
+---
+
+## Storage Comparison (1M Documents)
+
+- Cross-Encoder: `0 vectors (cannot pre-store)`  
+- Bi-Encoder: `1M × 768 floats ≈ 3 GB`  
+- ColBERT: `1M × ~60 tokens × 128 floats ≈ 30 GB`  
+<br>
+
+# Dense Retrieval with BERT and PEFT
+"""
 
 class DenseBERTRetriever:
   """Dense retrieval using BERT embeddings with PEFT for efficiency"""
@@ -645,4 +732,152 @@ dense_retriever.index_documents(collection.documents)
 
 query = Query(query_id="q3", text="war battle")
 dense_results = dense_retriever.search(query, top_k=3)
+
+"""#ColBERT Implementation"""
+
+class ColBERTRetriever:
+  """ColBERT: Efficient retireval via late interation over BERT with multi-vector embeddings of 128 dim per each token"""
+
+  def __init__(self, model_name: str = "bert-base-uncased", dim:int= 128):
+    self.device = device
+    self.dim = dim
+    self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+    self.bert = AutoModel.from_pretrained(model_name).to(self.device)
+
+    # Linear layer from BERT outputs to lower dim for the embeddings (128)
+    self.linear = nn.Linear(self.bert.config.hidden_size, dim).to(self.device)
+    self.doc_embeddings = {} # Cache embeddings
+
+  def encode_document(self, text:str, doc_id: str) -> torch.Tensor:
+    """Encode document to token-level embeddings"""
+
+    # Adding [D] special token for docs
+    text = "[D] " + text # doc marker
+
+    inputs = self.tokenizer(
+      text,
+      padding='max_length',
+      truncation=True,
+      max_length=128,
+      return_tensors='pt'
+    ).to(self.device)
+
+    with torch.no_grad():
+      outputs = self.bert(**inputs) # get bert outputs
+      token_embeddings = outputs.last_hidden_state # [1,seq len, hiddn size]
+
+      # Project to selected dimensionality (128)
+      token_embeddings = self.linear(token_embeddings) # [1,seq_len, 128]
+
+      # L2 Normalize each token embedding
+      token_embeddings = F.normalize(token_embeddings, dim=-1, p=2)
+
+    print(f"Encoded document '{doc_id}': shape={token_embeddings.shape}")
+
+    return token_embeddings.cpu() # moving to cou for storage
+
+
+  def encode_query(self, text:str) -> torch.Tensor:
+    """Encode query to token-level embeddings"""
+
+    # Adding [Q] special token for qrys
+    text = "[Q] " + text # qry marker
+
+
+    inputs = self.tokenizer(
+        text,
+        padding='max_length',
+        truncation=True,
+        max_length=32,
+        return_tensors='pt'
+    ).to(device)
+
+    # get attention mask to identify real vs padding tokens
+    attention_mask = inputs['attention_mask'] # [1, seq_len]
+
+    with torch.no_grad():
+      outputs = self.bert(**inputs) # get bert outputs
+      token_embeddings = outputs.last_hidden_state # [1,seq_len, hiddn_size]
+
+      # project to dim 128
+      token_embeddings = self.linear(token_embeddings) # [1, seq_len, 128]
+
+      # L2 norm
+      token_embeddings = F.normalize(token_embeddings, p=2, dim=-1)
+
+      # mask padding tokens
+      token_embeddings = token_embeddings * attention_mask.unsqueeze(-1) # zero out padding
+
+
+    return token_embeddings # keeping on device for cos sim
+
+
+  def index_documents(self,documents:List[Document]):
+    """Index all documents"""
+
+    print(f"\nIndexing {len(documents)} documents with ColBERT...")
+
+    for doc in documents:
+      embeddings = self.encode_document(doc.content, doc.doc_id)
+      self.doc_embeddings[doc.doc_id] = embeddings # cache embeddings
+
+  def compute_maxsim(self, query_embeddings: torch.Tensor, doc_embeddings:torch.Tensor) -> float:
+    """
+    Compute MaxSim score between query and document
+    Score(q,d) = Σ_i max_j (q_i · d_j) for all query tokens i and doc tokens j
+    """
+
+    query_embeddings = query_embeddings.to(self.device)
+    doc_embeddings = doc_embeddings.to(self.device)
+
+
+    # Compute all pairwise dot prod
+    # [1, q_len, dim] @ [1, d_len, dim]^T = [1, q_len, d_len]
+    similarity_matrix = torch.bmm(
+        query_embeddings,              # [1, q_len, dim]  = [1, 32, 128]
+        doc_embeddings.transpose(1,2)  # [1, dim, d_len]  = [1, 128, 128]
+
+    )                          # Result: [1, q_len, d_len] = [1, 32, 128]
+
+    # find max sim wit hany doc token for each query token
+    max_similarities, _ =  similarity_matrix.max(dim=2) # [1, q_len] = [1, 32]
+
+    # sum over all query tokens
+    score = max_similarities.sum().item() # scalar
+
+    return score
+
+  def search(self, query: Query, top_k: int=3) -> List[Tuple[str, float]]:
+    """Search using ColBERT MaxSim"""
+
+    # encode qry
+    query_embeddings = self.encode_query(query.text) # [1, q_len, dim]
+    print(f"\nColBERT search for: '{query.text}'")
+    print(f"Query embedding shape: {query_embeddings.shape}")
+
+
+    scores = []
+
+    for doc_id, doc_embeddings in self.doc_embeddings.items():
+      score = self.compute_maxsim(query_embeddings, doc_embeddings)
+      scores.append((doc_id, score))
+      print(f"  {doc_id}: MaxSim={score:.4f}")
+
+
+    # sort by score desc
+    scores.sort(key=lambda x: x[1], reverse=True) # sort by score desc
+
+    return scores[:top_k] # return only top k results
+
+"""## Test ColBERT
+
+"""
+
+colbert = ColBERTRetriever(dim=128)
+colbert.index_documents(collection.documents)
+
+query = Query(query_id="q4", text="fool love")
+colbert_results = colbert.search(query, top_k=3)
+
+print("The ranking (julius_caesar > twelfth_night > as_you_like_it) appears essentially random given the score similarities. For this to work properly, it is needed to either use a pre-trained ColBERT model or fine-tune the encoders and linear projection on retrieval data with proper contrastive loss.")
 
