@@ -123,7 +123,7 @@ class Query(BaseModel):
 class DocumentCollection(BaseModel):
   """Collection of documents with indexing capabilities"""
 
-  documents: List[Document] = Field(defualt_factory=list)
+  documents: List[Document] = Field(default_factory=list)
 
   def add_document(self, doc: Document):
     """Add validated document to collection"""
@@ -723,6 +723,9 @@ class DenseBERTRetriever:
       results.append((doc_id, score.item()))
       print(f"  {doc_id}: {score.item():.4f}")
 
+
+    return results
+
 """## Testing Dense Retrieval
 
 """
@@ -790,7 +793,7 @@ class ColBERTRetriever:
         truncation=True,
         max_length=32,
         return_tensors='pt'
-    ).to(device)
+    ).to(self.device)
 
     # get attention mask to identify real vs padding tokens
     attention_mask = inputs['attention_mask'] # [1, seq_len]
@@ -880,4 +883,193 @@ query = Query(query_id="q4", text="fool love")
 colbert_results = colbert.search(query, top_k=3)
 
 print("The ranking (julius_caesar > twelfth_night > as_you_like_it) appears essentially random given the score similarities. For this to work properly, it is needed to either use a pre-trained ColBERT model or fine-tune the encoders and linear projection on retrieval data with proper contrastive loss.")
+
+"""#RAG Implementation with HF and TRL"""
+
+class RAGSystem:
+  """Retrieval-Augmented Generation system with optimizations"""
+
+  def __init__(self, retriever, generator_model: str="gpt2", use_peft:bool = True):
+    self.retriever = retriever # Using any of the above: tfidf, bm25, bert, colbert
+    self.device = device
+
+    # loading tokenizer =
+    self.tokenizer = AutoTokenizer.from_pretrained(generator_model)
+    self.tokenizer.pad_token = self.tokenizer.eos_token # set padding tkn
+
+    # load generator with optional peft
+    if use_peft and torch.cuda.is_available():
+      # 8-bit quantization config
+      bnb_config = BitsAndBytesConfig(
+          load_in_8bit=True,
+          bnb_8bit_compute_dtype=torch.float16, # compute in float16
+          )
+
+      self.generator = AutoModelForCausalLM.from_pretrained(
+          generator_model,
+          quantization_config=bnb_config,
+          device_map="auto"
+      )
+
+      # prepare for training
+      self.generator = prepare_model_for_kbit_training(self.generator) # This method wraps the entire protocol for preparing a model before running a training. This includes: 1- Cast the layernorm in fp32 2- making output embedding layer require grads 3- Add the upcasting of the lm head to fp32 4- Freezing the base model layers to ensure they are not updated during training
+
+      # Add LoRA
+      peft_config = LoraConfig(
+          r=16,
+          lora_alpha=32,
+          target_modules=["c_attn", "c_proj"], # gpt2 attn layers
+          lora_dropout=0.1,
+          bias="none",
+          task_type=TaskType.CAUSAL_LM
+      )
+
+      self.generator = get_peft_model(self.generator, peft_config)
+      print("Generator with PEFT:")
+
+      self.generator.print_trainable_parameters()
+    else:
+      self.generator = AutoModelForCausalLM.from_pretrained(generator_model).to(self.device)
+
+  def retrieve_context(self, query:Query, top_k:int=3) -> str:
+    """Retrieve relevant docs and format as context"""
+
+    # get relevant docs with the retriever
+    if hasattr(self.retriever, 'search'):
+      if isinstance(self.retriever, DenseBERTRetriever) or isinstance(self.retriever, ColBERTRetriever):
+        results = self.retriever.search(query, top_k) # returns (doc_id, score) pairs
+        # get actual docs
+        doc_results = []
+        for doc_id, score in results:
+          doc = next((d for d in collection.documents if d.doc_id == doc_id), None)
+          if doc:
+            doc_results.append((doc, score))
+        results = doc_results
+      else:
+        results = self.retriever.search(query, top_k)
+    else:
+      results = [] # no retrieved passages/docs
+
+
+
+    # Format retrieved documents as context
+    context_parts = []
+    for i, (doc, score) in enumerate(results, 1):
+      context_parts.append(f"Document {i}: {doc.content}")  # Format each document
+
+    context = "\n".join(context_parts)  # Join all documents
+    print(f"\nRetrieved context ({len(results)} docs):\n{context}")
+
+    return context
+
+  def generate_answer(self, query:Query, max_length:int=100, temperature:float = 0.7) -> str:
+    """Generate answer using RAG"""
+
+    # Retrieve relevant context
+    context = self.retrieve_context(query, top_k=3)
+
+
+    # format prompt for generation
+    prompt = f"""Based on these documents, answer the question:
+
+
+{context}
+
+Question: {query.text}
+Answer:"""
+
+    print(f"\nRAG Prompt:\n{prompt}\n")
+
+    # Tokenize prompt
+    inputs = self.tokenizer(
+        prompt,
+        return_tensors='pt',
+        truncation=True,
+        max_length=512
+    ).to(self.device)
+
+    # generate answer
+    with torch.no_grad():
+      outputs = self.generator.generate(
+          **inputs,
+          max_new_tokens=max_length,
+          temperature=temperature,
+          do_sample=True, # sampling instead of greedy
+          top_p=0.9, # nucleus sampling
+          pad_token_id=self.tokenizer.eos_token_id, # token for padding
+          eos_token_id=self.tokenizer.eos_token_id, # token for end of sequence
+          )
+
+    # Decode generated tokens
+    generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # extract only the answer part after "Answer"
+    if "Answer:" in generated_text:
+      answer = generated_text.split("Answer:")[-1].strip() # text after the "Answer:"
+    else:
+      answer = generated_text[len(prompt):].strip() # generated part only
+
+
+    return answer
+
+
+  def train_with_feedback(self, qa_pairs:List[Tuple[Query,str]], use_trl:bool = True):
+    """Fine-tune generator with TRL for better RAG performance"""
+
+    if not use_trl:
+      print("Skipping TRL training")
+      return
+
+
+    # prepare training data
+    train_texts = []
+
+    for query,expected_answer in qa_pairs:
+      context = self.retrieve_context(query, top_k=2)
+      text = f"Context: {context}\nQuestion: {query.text}\nAnswer: {expected_answer}"  # Format training example
+      train_texts.append(text)
+
+
+    # huggingface dataset
+    train_dataset = HFDataset.from_dict({"text": train_texts}) # create dataset
+
+
+    # training arguments
+    training_args = TrainingArguments(
+        output_dir="./rag_model", # output path
+        num_train_epochs=1,
+        per_device_train_batch_size=1, # batchsize
+        gradient_accumulation_steps=4,
+        warmup_steps=10,
+        logging_steps=10, # log every N steps
+        save_strategy="no", # not saving checkpoints
+        report_to="none" # no report to wandb
+    )
+
+    # use SFTTrainer from TRL for supervised fine-tuning
+    trainer = SFTTrainer(
+        model=self.generator,
+        args=training_args,
+        train_dataset=train_dataset, # training data
+        tokenizer=self.tokenizer,
+        dataset_text_field="text", # field containing text
+        max_seq_length=512,
+    )
+
+
+    # Run training
+    print("\nFine-tuning with TRL...")
+    trainer.train()
+    print("Fine-tuning complete")
+
+"""# Test RAG system with the BM25 Retriever
+
+"""
+
+rag = RAGSystem(retriever=bm25, generator_model="gpt2", use_peft=torch.cuda.is_available())
+
+# Test the generation
+test_query = Query(query_id="q5", text="What plays involve battle and war?")
+answer = rag.generate_answer(test_query,max_length=50)
+print(f"\nGenerated Answer: {answer}")
 
